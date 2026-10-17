@@ -1,12 +1,11 @@
-# Code::Blocks — VS Code Edition
-
-Transforms **Code::Blocks** into a modern **VS Code Dark+** environment with **JetBrains Mono** typography, **50% opacity** selection/brace highlights, **`Ctrl + I/J/K/L`** cursor navigation, **live inline GCC/G++ LSP diagnostics (squiggles + Error Lens)**, and **single-file `F5` debugging** without needing a `.cbp` project.
+# Code::Blocks with vs code feel
+Do you even have a university that dont let you use vs code because vs code has a bunch of ai feature? you've come to the right repo! This transforms **Code::Blocks** into a modern **VS Code Dark+** environment with **JetBrains Mono** typography, **50% opacity** selection/brace highlights, **`Ctrl + I/J/K/L`** cursor navigation, **live inline GCC/G++ LSP diagnostics (squiggles + Error Lens)**, and **single-file `F5` debugging** without needing a `.cbp` project.
 
 ---
 
 ## Features
 
-1. **VS Code Dark+ Theme & Typography ("With a Cherry on Top")**
+1. **VS Code Dark+ Theme & Typography
    - Dark `#1E1E1E` editor background, dark gutters/line numbers/folding margins, and authentic VS Code Dark+ C/C++ & Python syntax palette.
    - **JetBrains Mono 11** default font (also bundles **Cascadia Code** and **Fira Code**).
    - **Cursive Italic Comments** (`JetBrains Mono Italic` in `#6A9955` olive green) while code stays crisp upright.
