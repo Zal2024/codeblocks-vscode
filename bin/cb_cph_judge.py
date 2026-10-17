@@ -607,6 +607,28 @@ class CPHJudgeWindow(Gtk.Window):
         return True
 
 if __name__ == "__main__":
+    # Touch trigger file so any already-running instance runs testcases & focuses itself
+    if "--run" in sys.argv:
+        try:
+            with open("/tmp/.cb_cph_run_trigger", "w") as tf:
+                tf.write(str(time.time()))
+        except Exception:
+            pass
+    pid_file = "/tmp/.cb_cph_judge.pid"
+    if os.path.isfile(pid_file):
+        try:
+            with open(pid_file, "r") as pf:
+                old_pid = int(pf.read().strip())
+            os.kill(old_pid, 0)
+            # Already running! It will pick up /tmp/.cb_cph_run_trigger within 350ms
+            sys.exit(0)
+        except Exception:
+            pass
+    try:
+        with open(pid_file, "w") as pf:
+            pf.write(str(os.getpid()))
+    except Exception:
+        pass
     win = CPHJudgeWindow()
     win.connect("destroy", Gtk.main_quit)
     win.show_all()

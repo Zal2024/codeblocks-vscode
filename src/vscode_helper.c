@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdint.h>
@@ -140,6 +141,18 @@ static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char g_workspace_dir[1024] = "";
 static char g_seen_files[256][256];
 static int g_seen_count = 0;
+
+
+static void dbg_log(const char *fmt, ...) {
+    FILE *fp = fopen("/tmp/vscode_helper.log", "a");
+    if (!fp) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    fprintf(fp, "\n");
+    va_end(ap);
+    fclose(fp);
+}
 
 static void resolve_cb_symbols(void) {
     if (fn_Manager_Get) return;
@@ -570,6 +583,7 @@ static int hover_tick(void *data) {
 static int periodic_tick(void *data) {
     (void)data;
     g_tick_counter++;
+    if (g_tick_counter <= 10) dbg_log("periodic_tick: counter=%d sci=%p", g_tick_counter, get_active_scintilla());
     if (g_tick_counter >= 5) g_startup_ready = 1;
     void *sci = get_active_scintilla();
     if (!sci || !fn_SendMsg) return 1;
@@ -616,13 +630,7 @@ static void launch_debugger(int asan) {
 }
 
 static void launch_cph_judge(void) {
-    // Touch trigger file so if CPH Judge is already open it re-runs immediately; otherwise launch it
-    FILE *tf = fopen("/tmp/.cb_cph_run_trigger", "w");
-    if (tf) {
-        fprintf(tf, "%ld\n", (long)time(NULL));
-        fclose(tf);
-    }
-    int r = system("pgrep -f cb_cph_judge.py >/dev/null 2>&1 || ($HOME/.local/bin/cb_cph_judge.py --run >/dev/null 2>&1 &)");
+    int r = system("$HOME/.local/bin/cb_cph_judge.py --run >/dev/null 2>&1 &");
     (void)r;
 }
 
@@ -689,12 +697,14 @@ __attribute__((constructor))
 static void init_vscode_helper(void) {
     gtk_key_snooper_install_fn install_snooper =
         (gtk_key_snooper_install_fn)dlsym(RTLD_DEFAULT, "gtk_key_snooper_install");
+    dbg_log("init_vscode_helper: install_snooper=%p", (void*)install_snooper);
     if (install_snooper) {
         install_snooper(my_key_snooper, NULL);
     }
 
     g_timeout_add_fn timeout_add =
         (g_timeout_add_fn)dlsym(RTLD_DEFAULT, "g_timeout_add");
+    dbg_log("init_vscode_helper: timeout_add=%p", (void*)timeout_add);
     if (timeout_add) {
         timeout_add(650, periodic_tick, NULL);
         timeout_add(150, hover_tick, NULL);
