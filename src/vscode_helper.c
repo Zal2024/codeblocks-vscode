@@ -30,6 +30,8 @@ typedef uint32_t (*g_timeout_add_fn)(uint32_t interval, int (*function)(void *),
 
 // Code::Blocks & wxScintilla function pointers
 typedef void* (*Manager_Get_fn)(void);
+typedef void* (*Manager_GetAppWindow_fn)(void *mgr);
+typedef int   (*Manager_IsAppShuttingDown_fn)(void);
 typedef void* (*Manager_GetEditorManager_fn)(void *mgr);
 typedef void* (*Manager_GetProjectManager_fn)(void *mgr);
 typedef void* (*EditorManager_GetActiveEditor_fn)(void *emgr);
@@ -51,7 +53,11 @@ typedef void  (*wxGetMousePosition_fn)(int *x, int *y);
 typedef void  (*wxWindow_DoScreenToClient_fn)(void *win, int *x, int *y);
 
 static Manager_Get_fn fn_Manager_Get = NULL;
+static Manager_GetAppWindow_fn fn_GetAppWindow = NULL;
+static Manager_IsAppShuttingDown_fn fn_IsAppShuttingDown = NULL;
 static Manager_GetEditorManager_fn fn_GetEditorManager = NULL;
+static int g_startup_ready = 0;
+static int g_tick_counter = 0;
 static Manager_GetProjectManager_fn fn_GetProjectManager = NULL;
 static EditorManager_GetActiveEditor_fn fn_GetActiveEditor = NULL;
 static EditorManager_GetBuiltinEditor_fn fn_GetBuiltinEditor = NULL;
@@ -138,6 +144,8 @@ static int g_seen_count = 0;
 static void resolve_cb_symbols(void) {
     if (fn_Manager_Get) return;
     fn_Manager_Get = (Manager_Get_fn)dlsym(RTLD_DEFAULT, "_ZN7Manager3GetEv");
+    fn_GetAppWindow = (Manager_GetAppWindow_fn)dlsym(RTLD_DEFAULT, "_ZNK7Manager12GetAppWindowEv");
+    fn_IsAppShuttingDown = (Manager_IsAppShuttingDown_fn)dlsym(RTLD_DEFAULT, "_ZN7Manager17IsAppShuttingDownEv");
     fn_GetEditorManager = (Manager_GetEditorManager_fn)dlsym(RTLD_DEFAULT, "_ZNK7Manager16GetEditorManagerEv");
     fn_GetProjectManager = (Manager_GetProjectManager_fn)dlsym(RTLD_DEFAULT, "_ZNK7Manager17GetProjectManagerEv");
     fn_GetActiveEditor = (EditorManager_GetActiveEditor_fn)dlsym(RTLD_DEFAULT, "_ZN13EditorManager15GetActiveEditorEv");
@@ -158,10 +166,12 @@ static void resolve_cb_symbols(void) {
 }
 
 static void* get_active_editor_base(void) {
+    if (!g_startup_ready) return NULL;
     resolve_cb_symbols();
-    if (!fn_Manager_Get || !fn_GetEditorManager || !fn_GetActiveEditor) return NULL;
+    if (!fn_Manager_Get || !fn_GetAppWindow || !fn_IsAppShuttingDown || !fn_GetEditorManager || !fn_GetActiveEditor) return NULL;
+    if (fn_IsAppShuttingDown()) return NULL;
     void *mgr = fn_Manager_Get();
-    if (!mgr) return NULL;
+    if (!mgr || !fn_GetAppWindow(mgr)) return NULL;
     void *emgr = fn_GetEditorManager(mgr);
     if (!emgr) return NULL;
     return fn_GetActiveEditor(emgr);
@@ -559,6 +569,8 @@ static int hover_tick(void *data) {
 
 static int periodic_tick(void *data) {
     (void)data;
+    g_tick_counter++;
+    if (g_tick_counter >= 5) g_startup_ready = 1;
     void *sci = get_active_scintilla();
     if (!sci || !fn_SendMsg) return 1;
 
