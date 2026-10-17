@@ -30,17 +30,23 @@ if [ -f "$HOME/.config/codeblocks/default.conf" ]; then
 fi
 sed "s|/home/fazal|$HOME|g" "$REPO_DIR/config/default.conf" > "$HOME/.config/codeblocks/default.conf"
 
-# 4. Compile & install libvscode_helper.so (IJKL nav, Live LSP squiggles & Error Lens, 50% opacity, 1.35x line-height)
+# 4. Compile & install libvscode_helper.so + plugin proxy loader
 echo "[3/5] Compiling libvscode_helper.so..."
 mkdir -p "$HOME/.local/share/codeblocks/plugins"
 gcc -shared -fPIC -O2 "$REPO_DIR/src/vscode_helper.c" -o "$HOME/.local/share/codeblocks/libvscode_helper.so" -ldl -lpthread
 
-# 5. Install single-file debugger & launcher scripts
-echo "[4/5] Installing single-file GDB/ASan debugger scripts..."
+# 5. Install single-file debugger, CPH Judge, & launcher scripts
+echo "[4/5] Installing single-file GDB/ASan debugger & CPH Judge scripts..."
 mkdir -p "$HOME/.local/bin"
 cp -f "$REPO_DIR/bin/cb_single_file_debug.sh" "$HOME/.local/bin/cb_single_file_debug.sh"
+cp -f "$REPO_DIR/bin/cb_cph_judge.py" "$HOME/.local/bin/cb_cph_judge.py"
 cp -f "$REPO_DIR/bin/codeblocks" "$HOME/.local/bin/codeblocks"
-chmod +x "$HOME/.local/bin/cb_single_file_debug.sh" "$HOME/.local/bin/codeblocks"
+chmod +x "$HOME/.local/bin/cb_single_file_debug.sh" "$HOME/.local/bin/cb_cph_judge.py" "$HOME/.local/bin/codeblocks"
+
+# Ignore auto-generated workspace file in git
+mkdir -p "$HOME/.config/git"
+grep -qxF ".vscode_workspace.cbp" "$HOME/.config/git/ignore" 2>/dev/null || echo ".vscode_workspace.cbp" >> "$HOME/.config/git/ignore"
+grep -qxF ".vscode_workspace.layout" "$HOME/.config/git/ignore" 2>/dev/null || echo ".vscode_workspace.layout" >> "$HOME/.config/git/ignore"
 
 # 6. Configure desktop launcher to preload libvscode_helper.so automatically
 echo "[5/5] Configuring desktop shortcut..."

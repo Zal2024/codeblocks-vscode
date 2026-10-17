@@ -5,25 +5,32 @@ Do you even have a university that dont let you use vs code because vs code has 
 
 ## Features
 
-1. **VS Code Dark+ Theme & Typography
-   - Dark `#1E1E1E` editor background, dark gutters/line numbers/folding margins, and authentic VS Code Dark+ C/C++ & Python syntax palette.
+1. **VS Code Dark+ Theme & Typography**
+   - Dark `#1E1E1E` editor background (including new unsaved `Untitled` / `Plain text` tabs!), dark gutters/line numbers/folding margins, and authentic VS Code Dark+ C/C++ & Python syntax palette.
    - **JetBrains Mono 11** default font (also bundles **Cascadia Code** and **Fira Code**).
    - **Cursive Italic Comments** (`JetBrains Mono Italic` in `#6A9955` olive green) while code stays crisp upright.
    - **1.35x Line-Height Breathing Room** (`+2px` extra ascent & descent via Scintilla) + **LCD Subpixel Anti-Aliasing**.
    - **50% Opacity Highlights** for text selection (`#233C58`), matching braces (`#2A485C`), and word occurrences.
 
-2. **`Ctrl + I / J / K / L` Cursor Navigation**
+2. **Auto-Workspace & Folder File Detection**
+   - Opening or saving any file automatically sets its parent folder as the active **Workspace** in the left **Projects** sidebar and detects all other source/project files in that folder (including newly saved files), just like VS Code's Explorer.
+
+3. **`Ctrl + I / J / K / L` Cursor Navigation**
    - `Ctrl + I` / `Ctrl + K` / `Ctrl + J` / `Ctrl + L` — Move **Up / Down / Left / Right**
    - `Ctrl + Shift + I / J / K / L` — **Select** Up / Left / Down / Right
    - `Ctrl + Alt + J / L` — Jump **Word Left / Word Right**
    - `Ctrl + Alt + Shift + J / L` — **Select Word** Left / Right
 
-3. **Live VS Code LSP Diagnostics & Error Lens**
+4. **Live VS Code LSP Diagnostics, Squiggles & Mouse Hover Tooltips**
    - Background `gcc`/`g++ -fsyntax-only -Wall -Wextra -Wformat=2` checker runs automatically as you type.
-   - Draws red/yellow **squiggly underlines** (`INDIC_SQUIGGLE`) and inline **Error Lens** boxed messages directly underneath lines with errors or warnings.
-   - Press **`Ctrl + Shift + M`** to toggle inline Error Lens annotations on/off.
+   - **Warnings** (such as `unused variable` or `uninitialized`) show only a subtle **yellow squiggly underline** underneath the code, and display the warning message in a dark popup tooltip **only when you hover your mouse over it**.
+   - **Errors** draw red squiggly underlines and inline **Error Lens** boxes (press **`Ctrl + Shift + M`** to toggle inline boxes for warnings too).
 
-4. **Single-File Debugging (`F5` & `Ctrl + F5`) — No Project Required**
+5. **CPH Judge (Competitive Programming Helper) — `Ctrl + Alt + B` / `F6`**
+   - Press **`Ctrl + Alt + B`** or **`F6`** (or **Tools → CPH Judge**) to open the **CPH Judge: Results** sidebar and run all testcases against your active file.
+   - Reads and writes `.cph/*.prob` testcase files (100% compatible with VS Code's CPH extension), with `+ New Testcase`, per-testcase `▷` Run & `🗑` Delete, `Set ONLINE_JUDGE`, execution time in `ms`, and `N / M passed` badges.
+
+6. **Single-File Debugging (`F5` & `Ctrl + F5`) — No Project Required**
    - **`F5`** — Compiles the active `.c`/`.cpp` file with `-g3 -O0` and launches **GDB Visual Split-Screen (`gdb -tui`)**.
    - **`Ctrl + F5`** — Compiles and runs the active file with **AddressSanitizer + UndefinedBehaviorSanitizer** (`-fsanitize=address,undefined -g3`) to catch segfaults, out-of-bounds accesses, and memory bugs with exact line numbers.
 
