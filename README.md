@@ -53,4 +53,12 @@ git clone https://github.com/Zal2024/codeblocks-vscode.git
 cd codeblocks-vscode
 powershell -ExecutionPolicy Bypass -File .\windows\install-windows.ps1
 ```
-*(For `Ctrl + I/J/K/L` navigation on Windows, run [`windows/vscode_ijkl.ahk`](windows/vscode_ijkl.ahk) with [AutoHotkey v2](https://www.autohotkey.com/).)*
+
+> [!TIP]
+> **Windows Keybindings & Single-File Shortcuts:**
+> Run [`windows/vscode_ijkl.ahk`](windows/vscode_ijkl.ahk) with [AutoHotkey v2](https://www.autohotkey.com/) to enable:
+> - `Ctrl + I / J / K / L` cursor navigation
+> - `F5`: Single-File GDB Visual Debugger (`cb_single_file_debug.ps1`)
+> - `Ctrl + F5`: AddressSanitizer + UndefinedBehaviorSanitizer Runner
+> - `F6` or `Ctrl + Alt + B`: CPH Judge (`cb_cph_judge.py`)
+
