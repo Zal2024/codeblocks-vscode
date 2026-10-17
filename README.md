@@ -48,6 +48,10 @@ cd codeblocks-vscode
 
 ### Windows (PowerShell)
 
+> [!WARNING]
+> **Windows Version is Unstable / Experimental:**
+> Due to differences in Code::Blocks' Windows implementation (including wxWidgets font rendering, plugin loading architecture, and background parsing timers), the Windows version may be unstable or behave inconsistently across different environments. Linux is the recommended and primary platform for the best experience.
+
 ```powershell
 git clone https://github.com/Zal2024/codeblocks-vscode.git
 cd codeblocks-vscode
