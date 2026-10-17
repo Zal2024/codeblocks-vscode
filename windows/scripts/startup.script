@@ -1,0 +1,25 @@
+/*
+ * Code::Blocks VS Code Edition startup script
+ */
+
+Log(_("Running Code::Blocks VS Code Edition startup script..."));
+
+// Include default broken files plugin
+Include(_T("plugin_find_broken_files.script"));
+GetScriptingManager().RegisterScriptMenu(_("&Settings") + _T("/-") + _("Edit startup script"), _T("edit_startup_script.script"), false);
+
+// VS Code Warmup: automatically load warmup project if no project is active.
+// This initializes NativeParser so that opening Untitled tabs or single files
+// provides instant C/C++ autocompletion and eliminates "The Parser is still parsing files."
+local pmgr = GetProjectManager();
+if (pmgr && pmgr.GetProjectCount() == 0)
+{
+    local appdata = GetFolder(sdConfig);
+    local cbpPath = appdata + _T("\\workspace\\.vscode_workspace.cbp");
+    local proj = pmgr.LoadProject(cbpPath, true);
+    if (proj)
+    {
+        proj.SetModified(false);
+        Log(_("VS Code Warmup workspace successfully loaded: ") + cbpPath);
+    }
+}

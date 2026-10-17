@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <string.h>
 #include <wchar.h>
@@ -14,11 +15,13 @@ typedef void* (*Manager_GetEditorManager_fn)(void *mgr);
 typedef void* (*Manager_GetProjectManager_fn)(void *mgr);
 typedef void* (*EditorManager_GetActiveEditor_fn)(void *emgr);
 typedef void* (*EditorManager_GetBuiltinEditor_fn)(void *emgr, void *ebase);
+typedef const void* (*EditorBase_GetFilename_fn)(const void *ebase);
 typedef void* (*cbEditor_GetControl_fn)(void *cbed);
 typedef long long (*wxScintilla_SendMsg_fn)(void *sci, unsigned int msg, unsigned long long wp, long long lp);
 
 // ProjectManager & wxString helpers
 typedef void* (*cbC2U_fn)(void *wxstr_out, const char *utf8);
+typedef void* (*ProjectManager_GetActiveProject_fn)(void *pmgr);
 typedef void* (*ProjectManager_LoadProject_fn)(void *pmgr, const void *wxstr_path, int activateIt);
 typedef void* (*ProjectManager_AddFileToProject_fn)(void *pmgr, const void *wxstr_path, void *proj, int target);
 typedef void* (*ProjectManager_GetWorkspace_fn)(void *pmgr);
@@ -36,10 +39,12 @@ static Manager_GetEditorManager_fn fn_GetEditorManager = NULL;
 static Manager_GetProjectManager_fn fn_GetProjectManager = NULL;
 static EditorManager_GetActiveEditor_fn fn_GetActiveEditor = NULL;
 static EditorManager_GetBuiltinEditor_fn fn_GetBuiltinEditor = NULL;
+static EditorBase_GetFilename_fn fn_GetFilename = NULL;
 static cbEditor_GetControl_fn fn_GetControl = NULL;
 static wxScintilla_SendMsg_fn fn_SendMsg = NULL;
 
 static cbC2U_fn fn_cbC2U = NULL;
+static ProjectManager_GetActiveProject_fn fn_GetActiveProject = NULL;
 static ProjectManager_LoadProject_fn fn_LoadProject = NULL;
 static ProjectManager_AddFileToProject_fn fn_AddFileToProject = NULL;
 static ProjectManager_GetWorkspace_fn fn_GetWorkspace = NULL;
@@ -50,6 +55,25 @@ static wxWindow_DoScreenToClient_fn fn_ScreenToClient = NULL;
 
 static int g_startup_ready = 0;
 static int g_tick_counter = 0;
+static DWORD g_main_thread_id = 0;
+static HHOOK g_getmsg_hook = NULL;
+static HHOOK g_kbd_hook = NULL;
+static volatile LONG g_timer_installed = 0;
+
+static void dbg_log(const char *fmt, ...) {
+    char temp_dir[MAX_PATH];
+    if (!GetTempPathA(sizeof(temp_dir), temp_dir)) return;
+    char log_path[MAX_PATH];
+    snprintf(log_path, sizeof(log_path), "%scb_vscode_helper.log", temp_dir);
+    FILE *fp = fopen(log_path, "a");
+    if (!fp) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    fprintf(fp, "\n");
+    va_end(ap);
+    fclose(fp);
+}
 
 // Scintilla constants
 #define SCI_GETLENGTH               2006
@@ -63,9 +87,10 @@ static int g_tick_counter = 0;
 #define SCI_INDICSETSTYLE           2080
 #define SCI_INDICSETFORE            2082
 #define SCI_SETCARETLINEBACK        2098
-#define SCI_POSITIONFROMLINE        2167
+#define SCI_AUTOCACTIVE             2102
 #define SCI_GETLINEENDPOSITION      2136
 #define SCI_LINEFROMPOSITION        2166
+#define SCI_POSITIONFROMLINE        2167
 #define SCI_GETTEXT                 2182
 #define SCI_CALLTIPSHOW             2200
 #define SCI_CALLTIPCANCEL           2201
@@ -74,11 +99,23 @@ static int g_tick_counter = 0;
 #define SCI_CALLTIPSETFORE          2206
 #define SCI_SETFOLDMARGINCOLOUR     2290
 #define SCI_SETFOLDMARGINHICOLOUR   2291
+#define SCI_LINEDOWN                2300
+#define SCI_LINEDOWNEXTEND          2301
+#define SCI_LINEUP                  2302
+#define SCI_LINEUPEXTEND            2303
+#define SCI_CHARLEFT                2304
+#define SCI_CHARLEFTEXTEND          2305
+#define SCI_CHARRIGHT               2306
+#define SCI_CHARRIGHTEXTEND         2307
+#define SCI_WORDLEFT                2308
+#define SCI_WORDLEFTEXTEND          2309
+#define SCI_WORDRIGHT               2310
+#define SCI_WORDRIGHTEXTEND         2311
 #define SCI_SETSELALPHA             2478
 #define SCI_STYLEGETBACK            2482
 #define SCI_SETINDICATORCURRENT     2500
-#define SCI_INDICATORCLEARRANGE     2505
 #define SCI_INDICATORFILLRANGE      2504
+#define SCI_INDICATORCLEARRANGE     2505
 #define SCI_INDICSETALPHA           2523
 #define SCI_SETEXTRAASCENT          2525
 #define SCI_SETEXTRADESCENT         2527
@@ -108,7 +145,7 @@ static int g_diag_count = 0;
 static uint64_t g_last_hash = 0;
 static void *g_last_sci = NULL;
 static int g_show_annotations = 0;
-static int g_checker_busy = 0;
+static volatile LONG g_checker_busy = 0;
 static int g_hover_calltip_active = 0;
 static int g_last_hover_line = -1;
 static CRITICAL_SECTION g_cs;
@@ -122,33 +159,36 @@ static void resolve_cb_symbols(void) {
     if (fn_Manager_Get) return;
 
     HMODULE hCB = GetModuleHandleW(L"codeblocks.dll");
-    if (!hCB) hCB = LoadLibraryW(L"codeblocks.dll");
+    if (!hCB) return;
     HMODULE hWX = GetModuleHandleW(L"wxmsw32u_gcc_custom.dll");
-    if (!hWX) hWX = LoadLibraryW(L"wxmsw32u_gcc_custom.dll");
 
-    if (hCB) {
-        fn_Manager_Get = (Manager_Get_fn)GetProcAddress(hCB, "_ZN7Manager3GetEv");
-        fn_GetAppWindow = (Manager_GetAppWindow_fn)GetProcAddress(hCB, "_ZNK7Manager12GetAppWindowEv");
-        fn_IsAppShuttingDown = (Manager_IsAppShuttingDown_fn)GetProcAddress(hCB, "_ZN7Manager17IsAppShuttingDownEv");
-        fn_GetEditorManager = (Manager_GetEditorManager_fn)GetProcAddress(hCB, "_ZNK7Manager16GetEditorManagerEv");
-        fn_GetProjectManager = (Manager_GetProjectManager_fn)GetProcAddress(hCB, "_ZNK7Manager17GetProjectManagerEv");
-        fn_GetActiveEditor = (EditorManager_GetActiveEditor_fn)GetProcAddress(hCB, "_ZN13EditorManager15GetActiveEditorEv");
-        fn_GetBuiltinEditor = (EditorManager_GetBuiltinEditor_fn)GetProcAddress(hCB, "_ZN13EditorManager16GetBuiltinEditorEP10EditorBase");
-        fn_GetControl = (cbEditor_GetControl_fn)GetProcAddress(hCB, "_ZNK8cbEditor10GetControlEv");
-        fn_SendMsg = (wxScintilla_SendMsg_fn)GetProcAddress(hCB, "_ZNK11wxScintilla7SendMsgEiyx");
+    fn_Manager_Get = (Manager_Get_fn)GetProcAddress(hCB, "_ZN7Manager3GetEv");
+    fn_GetAppWindow = (Manager_GetAppWindow_fn)GetProcAddress(hCB, "_ZNK7Manager12GetAppWindowEv");
+    fn_IsAppShuttingDown = (Manager_IsAppShuttingDown_fn)GetProcAddress(hCB, "_ZN7Manager17IsAppShuttingDownEv");
+    fn_GetEditorManager = (Manager_GetEditorManager_fn)GetProcAddress(hCB, "_ZNK7Manager16GetEditorManagerEv");
+    fn_GetProjectManager = (Manager_GetProjectManager_fn)GetProcAddress(hCB, "_ZNK7Manager17GetProjectManagerEv");
+    fn_GetActiveEditor = (EditorManager_GetActiveEditor_fn)GetProcAddress(hCB, "_ZN13EditorManager15GetActiveEditorEv");
+    fn_GetBuiltinEditor = (EditorManager_GetBuiltinEditor_fn)GetProcAddress(hCB, "_ZN13EditorManager16GetBuiltinEditorEP10EditorBase");
+    fn_GetFilename = (EditorBase_GetFilename_fn)GetProcAddress(hCB, "_ZNK10EditorBase11GetFilenameEv");
+    fn_GetControl = (cbEditor_GetControl_fn)GetProcAddress(hCB, "_ZNK8cbEditor10GetControlEv");
+    fn_SendMsg = (wxScintilla_SendMsg_fn)GetProcAddress(hCB, "_ZNK11wxScintilla7SendMsgEiyx");
 
-        fn_cbC2U = (cbC2U_fn)GetProcAddress(hCB, "_Z5cbC2UPKc");
-        fn_LoadProject = (ProjectManager_LoadProject_fn)GetProcAddress(hCB, "_ZN14ProjectManager11LoadProjectERK8wxStringb");
-        fn_GetWorkspace = (ProjectManager_GetWorkspace_fn)GetProcAddress(hCB, "_ZN14ProjectManager12GetWorkspaceEv");
-        fn_ProjSetModified = (cbProject_SetModified_fn)GetProcAddress(hCB, "_ZN9cbProject11SetModifiedEb");
-        fn_WsSetModified = (cbWorkspace_SetModified_fn)GetProcAddress(hCB, "_ZN11cbWorkspace11SetModifiedEb");
-        fn_AddFileToProject = (ProjectManager_AddFileToProject_fn)GetProcAddress(hCB, "_ZN14ProjectManager16AddFileToProjectERK8wxStringP9cbProjecti");
-    }
+    fn_cbC2U = (cbC2U_fn)GetProcAddress(hCB, "_Z5cbC2UPKc");
+    fn_GetActiveProject = (ProjectManager_GetActiveProject_fn)GetProcAddress(hCB, "_ZNK14ProjectManager16GetActiveProjectEv");
+    if (!fn_GetActiveProject)
+        fn_GetActiveProject = (ProjectManager_GetActiveProject_fn)GetProcAddress(hCB, "_ZN14ProjectManager16GetActiveProjectEv");
+    fn_LoadProject = (ProjectManager_LoadProject_fn)GetProcAddress(hCB, "_ZN14ProjectManager11LoadProjectERK8wxStringb");
+    fn_GetWorkspace = (ProjectManager_GetWorkspace_fn)GetProcAddress(hCB, "_ZN14ProjectManager12GetWorkspaceEv");
+    fn_ProjSetModified = (cbProject_SetModified_fn)GetProcAddress(hCB, "_ZN9cbProject11SetModifiedEb");
+    fn_WsSetModified = (cbWorkspace_SetModified_fn)GetProcAddress(hCB, "_ZN11cbWorkspace11SetModifiedEb");
+    fn_AddFileToProject = (ProjectManager_AddFileToProject_fn)GetProcAddress(hCB, "_ZN14ProjectManager16AddFileToProjectERK8wxStringP9cbProjecti");
 
     if (hWX) {
         fn_wxGetMousePos = (wxGetMousePosition_fn)GetProcAddress(hWX, "_Z18wxGetMousePositionPiS_");
         fn_ScreenToClient = (wxWindow_DoScreenToClient_fn)GetProcAddress(hWX, "_ZNK8wxWindow16DoScreenToClientEPiS0_");
     }
+    dbg_log("resolve_cb_symbols: Manager_Get=%p GetFilename=%p GetActiveProject=%p LoadProject=%p",
+            (void*)fn_Manager_Get, (void*)fn_GetFilename, (void*)fn_GetActiveProject, (void*)fn_LoadProject);
 }
 
 static void* get_active_editor_base(void) {
@@ -177,14 +217,14 @@ static int get_active_filepath(char *out_path, size_t max_len) {
     out_path[0] = '\0';
     void *eb = get_active_editor_base();
     if (!eb) return 0;
-    const wchar_t *wpath = *(const wchar_t**)((char*)eb + 0x2f0);
+    // EditorBase::m_Filename is at offset 0x2a0 in 64-bit Code::Blocks (wxString / std::wstring)
+    const wchar_t *wpath = *(const wchar_t**)((const char*)eb + 0x2a0);
     if (!wpath || !wpath[0]) return 0;
-    size_t n = wcstombs(out_path, wpath, max_len - 1);
-    if (n == (size_t)-1) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, out_path, (int)max_len, NULL, NULL);
+    if (n <= 0) {
         out_path[0] = '\0';
         return 0;
     }
-    out_path[n] = '\0';
     return (out_path[0] != '\0');
 }
 
@@ -204,18 +244,19 @@ static int was_file_seen(const char *name) {
     return 0;
 }
 
-static void sync_folder_workspace(const char *active_file) {
+static void sync_folder_workspace(const char *active_file, int save_active_tracker) {
     if (!active_file || !active_file[0]) return;
 
-    // Save active file to %TEMP%\cb_active_file.txt for CPH Judge & Debugger
-    char temp_dir[MAX_PATH];
-    if (GetTempPathA(sizeof(temp_dir), temp_dir)) {
-        char act_file_path[MAX_PATH];
-        snprintf(act_file_path, sizeof(act_file_path), "%scb_active_file.txt", temp_dir);
-        FILE *af = fopen(act_file_path, "w");
-        if (af) {
-            fprintf(af, "%s\n", active_file);
-            fclose(af);
+    if (save_active_tracker) {
+        char temp_dir[MAX_PATH];
+        if (GetTempPathA(sizeof(temp_dir), temp_dir)) {
+            char act_file_path[MAX_PATH];
+            snprintf(act_file_path, sizeof(act_file_path), "%scb_active_file.txt", temp_dir);
+            FILE *af = fopen(act_file_path, "w");
+            if (af) {
+                fprintf(af, "%s\n", active_file);
+                fclose(af);
+            }
         }
     }
 
@@ -239,8 +280,7 @@ static void sync_folder_workspace(const char *active_file) {
     if (fwd_f && fwd_f > folder_name) folder_name = fwd_f;
     folder_name = folder_name ? (folder_name + 1) : dir;
 
-    void *active_proj = *(void**)((char*)pmgr + 0x68);
-    void *ui = *(void**)((char*)pmgr + 0x60);
+    void *active_proj = fn_GetActiveProject ? fn_GetActiveProject(pmgr) : NULL;
 
     // Case 1: Folder changed or no active project loaded
     if (_stricmp(g_workspace_dir, dir) != 0 || !active_proj) {
@@ -289,6 +329,7 @@ static void sync_folder_workspace(const char *active_file) {
 
         strncpy(g_workspace_dir, dir, sizeof(g_workspace_dir) - 1);
 
+        dbg_log("sync_folder_workspace: loading project %s", cbp_path);
         unsigned char wxstr[64];
         memset(wxstr, 0, sizeof(wxstr));
         fn_cbC2U(wxstr, cbp_path);
@@ -297,10 +338,6 @@ static void sync_folder_workspace(const char *active_file) {
         if (fn_GetWorkspace && fn_WsSetModified) {
             void *ws = fn_GetWorkspace(pmgr);
             if (ws) fn_WsSetModified(ws, 0);
-        }
-        if (ui) {
-            void (**vtable)(void*) = *(void (***)(void*))ui;
-            if (vtable && vtable[4]) vtable[4](ui);
         }
         return;
     }
@@ -341,11 +378,33 @@ static void sync_folder_workspace(const char *active_file) {
             void *ws = fn_GetWorkspace(pmgr);
             if (ws) fn_WsSetModified(ws, 0);
         }
-        if (ui) {
-            void (**vtable)(void*) = *(void (***)(void*))ui;
-            if (vtable && vtable[4]) vtable[4](ui);
+    }
+}
+
+static void ensure_warmup_workspace_loaded(void) {
+    if (!fn_GetProjectManager || !fn_GetActiveProject) return;
+    void *mgr = fn_Manager_Get();
+    if (!mgr) return;
+    void *pmgr = fn_GetProjectManager(mgr);
+    if (!pmgr) return;
+    if (fn_GetActiveProject(pmgr) != NULL) return;
+
+    char temp_dir[MAX_PATH];
+    if (!GetTempPathA(sizeof(temp_dir), temp_dir)) return;
+    char ws_dir[MAX_PATH];
+    snprintf(ws_dir, sizeof(ws_dir), "%scb_vscode_workspace", temp_dir);
+    CreateDirectoryA(ws_dir, NULL);
+
+    char warmup_cpp[MAX_PATH];
+    snprintf(warmup_cpp, sizeof(warmup_cpp), "%s\\vscode_warmup.cpp", ws_dir);
+    if (GetFileAttributesA(warmup_cpp) == INVALID_FILE_ATTRIBUTES) {
+        FILE *fp = fopen(warmup_cpp, "w");
+        if (fp) {
+            fprintf(fp, "#include <iostream>\n#include <vector>\n#include <string>\n#include <algorithm>\nint main() { return 0; }\n");
+            fclose(fp);
         }
     }
+    sync_folder_workspace(warmup_cpp, 0);
 }
 
 static uint64_t hash_str(const char *s, size_t len) {
@@ -360,7 +419,7 @@ static uint64_t hash_str(const char *s, size_t len) {
 static void apply_scintilla_opacity(void *sci) {
     if (!sci || !fn_SendMsg) return;
 
-    // 0. Dark mode for Untitled / Plain text editors
+    // 0. Dark mode for Untitled / Plain text editors & CallTips
     fn_SendMsg(sci, SCI_STYLESETBACK, 32, 0x1E1E1E); // #1E1E1E
     fn_SendMsg(sci, SCI_STYLESETFORE, 32, 0xD4D4D4); // #D4D4D4
     if (fn_SendMsg(sci, SCI_STYLEGETBACK, 0, 0) == 0xFFFFFF) {
@@ -373,6 +432,8 @@ static void apply_scintilla_opacity(void *sci) {
     fn_SendMsg(sci, SCI_SETCARETFORE, 0xADAFEA, 0);
     fn_SendMsg(sci, SCI_SETFOLDMARGINCOLOUR, 1, 0x1E1E1E);
     fn_SendMsg(sci, SCI_SETFOLDMARGINHICOLOUR, 1, 0x1E1E1E);
+    fn_SendMsg(sci, SCI_CALLTIPSETBACK, 0x262525, 0);
+    fn_SendMsg(sci, SCI_CALLTIPSETFORE, 0xD4D4D4, 0);
 
     // 1. 50% Opacity Highlights (Selection & Braces)
     fn_SendMsg(sci, SCI_STYLESETBACK, 34, 0x58462A);
@@ -447,7 +508,7 @@ static DWORD WINAPI run_compiler_thread(LPVOID arg) {
     char temp_dir[MAX_PATH];
     if (!GetTempPathA(sizeof(temp_dir), temp_dir)) {
         free(code);
-        g_checker_busy = 0;
+        InterlockedExchange(&g_checker_busy, 0);
         return 0;
     }
 
@@ -456,78 +517,124 @@ static DWORD WINAPI run_compiler_thread(LPVOID arg) {
     FILE *fp = fopen(tmp_src, "w");
     if (!fp) {
         free(code);
-        g_checker_busy = 0;
+        InterlockedExchange(&g_checker_busy, 0);
         return 0;
     }
     fputs(code, fp);
     fclose(fp);
     free(code);
 
+    const char *gpp_exe = "g++.exe";
+    if (GetFileAttributesA("C:\\msys64\\ucrt64\\bin\\g++.exe") != INVALID_FILE_ATTRIBUTES) {
+        gpp_exe = "C:\\msys64\\ucrt64\\bin\\g++.exe";
+    }
+
     char cmd[MAX_PATH * 2];
-    snprintf(cmd, sizeof(cmd), "g++ -fsyntax-only -Wall -Wextra -Wformat=2 -fdiagnostics-color=never \"%s\" 2>&1", tmp_src);
-    FILE *pipe = _popen(cmd, "r");
-    if (!pipe) {
-        g_checker_busy = 0;
+    snprintf(cmd, sizeof(cmd), "\"%s\" -fsyntax-only -Wall -Wextra -Wformat=2 -fdiagnostics-color=never \"%s\"", gpp_exe, tmp_src);
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    HANDLE hRead = NULL, hWrite = NULL;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        InterlockedExchange(&g_checker_busy, 0);
         return 0;
     }
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWrite;
+    si.hStdError = hWrite;
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(hRead);
+        CloseHandle(hWrite);
+        InterlockedExchange(&g_checker_busy, 0);
+        return 0;
+    }
+    CloseHandle(hWrite);
+
+    char out_buf[16384];
+    DWORD total_read = 0, bytes_read = 0;
+    while (total_read < sizeof(out_buf) - 1 &&
+           ReadFile(hRead, out_buf + total_read, (DWORD)(sizeof(out_buf) - 1 - total_read), &bytes_read, NULL) &&
+           bytes_read > 0) {
+        total_read += bytes_read;
+    }
+    out_buf[total_read] = '\0';
+
+    CloseHandle(hRead);
+    WaitForSingleObject(pi.hProcess, 3000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
 
     DiagItem local_diags[64];
     int count = 0;
-    char line_buf[512];
-    while (fgets(line_buf, sizeof(line_buf), pipe) && count < 64) {
-        if (!strstr(line_buf, "cb_lsp_live.cpp:")) continue;
-        char *p = strstr(line_buf, "cb_lsp_live.cpp:") + 16;
-        int line_num = atoi(p);
-        if (line_num <= 0) continue;
-        p = strchr(p, ':');
-        if (!p) continue;
-        p++;
-        if (*p >= '0' && *p <= '9') {
-            p = strchr(p, ':');
-            if (!p) continue;
-            p++;
-        }
-        while (*p == ' ') p++;
-
-        int is_err = 0;
-        const char *msg_start = NULL;
-        if (strncmp(p, "error:", 6) == 0 || strncmp(p, "fatal error:", 12) == 0) {
-            is_err = 1;
-            msg_start = strchr(p, ':') + 1;
-        } else if (strncmp(p, "warning:", 8) == 0) {
-            is_err = 0;
-            msg_start = p + 8;
-        } else {
-            continue;
-        }
-        while (*msg_start == ' ') msg_start++;
-        char *nl = strpbrk((char*)msg_start, "\r\n");
-        if (nl) *nl = '\0';
-
-        int merged = 0;
-        for (int j = 0; j < count; j++) {
-            if (local_diags[j].line == line_num - 1) {
-                if (is_err) local_diags[j].is_err = 1;
-                merged = 1;
-                break;
+    char *saveptr = NULL;
+    char *line_str = strtok_s(out_buf, "\r\n", &saveptr);
+    while (line_str && count < 64) {
+        char *match = strstr(line_str, "cb_lsp_live.cpp:");
+        if (match) {
+            char *p = match + 16;
+            int line_num = atoi(p);
+            if (line_num > 0) {
+                p = strchr(p, ':');
+                if (p) {
+                    p++;
+                    if (*p >= '0' && *p <= '9') {
+                        p = strchr(p, ':');
+                        if (p) p++;
+                    }
+                    if (p) {
+                        while (*p == ' ') p++;
+                        int is_err = -1;
+                        const char *msg_start = NULL;
+                        if (strncmp(p, "error:", 6) == 0 || strncmp(p, "fatal error:", 12) == 0) {
+                            is_err = 1;
+                            msg_start = strchr(p, ':') + 1;
+                        } else if (strncmp(p, "warning:", 8) == 0) {
+                            is_err = 0;
+                            msg_start = p + 8;
+                        }
+                        if (is_err >= 0 && msg_start) {
+                            while (*msg_start == ' ') msg_start++;
+                            int merged = 0;
+                            for (int j = 0; j < count; j++) {
+                                if (local_diags[j].line == line_num - 1) {
+                                    if (is_err) local_diags[j].is_err = 1;
+                                    merged = 1;
+                                    break;
+                                }
+                            }
+                            if (!merged) {
+                                local_diags[count].line = line_num - 1;
+                                local_diags[count].is_err = is_err;
+                                snprintf(local_diags[count].msg, sizeof(local_diags[count].msg),
+                                         "  %s %s  ", is_err ? "[Error]" : "[Warning]", msg_start);
+                                count++;
+                            }
+                        }
+                    }
+                }
             }
         }
-        if (!merged) {
-            local_diags[count].line = line_num - 1;
-            local_diags[count].is_err = is_err;
-            snprintf(local_diags[count].msg, sizeof(local_diags[count].msg),
-                     "  %s %s  ", is_err ? "[Error]" : "[Warning]", msg_start);
-            count++;
-        }
+        line_str = strtok_s(NULL, "\r\n", &saveptr);
     }
-    _pclose(pipe);
 
     EnterCriticalSection(&g_cs);
     memcpy(g_diags, local_diags, sizeof(DiagItem) * count);
     g_diag_count = count;
     LeaveCriticalSection(&g_cs);
 
-    g_checker_busy = 0;
+    InterlockedExchange(&g_checker_busy, 0);
     return 0;
 }
 
@@ -573,7 +680,9 @@ static void hover_tick(void) {
 
 static void periodic_tick(void) {
     g_tick_counter++;
-    if (g_tick_counter >= 5) g_startup_ready = 1;
+    if (g_tick_counter >= 6) g_startup_ready = 1;
+    if (!g_startup_ready) return;
+
     void *sci = get_active_scintilla();
     if (!sci || !fn_SendMsg) return;
 
@@ -581,27 +690,31 @@ static void periodic_tick(void) {
 
     char active_file[MAX_PATH];
     if (get_active_filepath(active_file, sizeof(active_file))) {
-        sync_folder_workspace(active_file);
+        DWORD attr = GetFileAttributesA(active_file);
+        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            sync_folder_workspace(active_file, 1);
+        } else {
+            ensure_warmup_workspace_loaded();
+        }
     }
 
     long long len = fn_SendMsg(sci, SCI_GETLENGTH, 0, 0);
     if (len <= 0 || len > 250000) return;
 
-    char *buf = (char*)malloc(len + 2);
+    char *buf = (char*)malloc((size_t)len + 2);
     if (!buf) return;
-    fn_SendMsg(sci, SCI_GETTEXT, len + 1, (long long)buf);
-    uint64_t h = hash_str(buf, len);
+    fn_SendMsg(sci, SCI_GETTEXT, (unsigned long long)(len + 1), (long long)buf);
+    uint64_t h = hash_str(buf, (size_t)len);
 
-    if ((h != g_last_hash || sci != g_last_sci) && !g_checker_busy) {
+    if ((h != g_last_hash || sci != g_last_sci) && InterlockedCompareExchange(&g_checker_busy, 1, 0) == 0) {
         g_last_hash = h;
         g_last_sci = sci;
-        g_checker_busy = 1;
         HANDLE hThread = CreateThread(NULL, 0, run_compiler_thread, buf, 0, NULL);
         if (hThread) {
             CloseHandle(hThread);
         } else {
             free(buf);
-            g_checker_busy = 0;
+            InterlockedExchange(&g_checker_busy, 0);
         }
     } else {
         free(buf);
@@ -609,32 +722,141 @@ static void periodic_tick(void) {
     }
 }
 
-static DWORD WINAPI background_worker(LPVOID lpParam) {
-    (void)lpParam;
-    int tick_mod = 0;
-    while (1) {
-        Sleep(150);
-        if (fn_IsAppShuttingDown && fn_IsAppShuttingDown()) break;
-        hover_tick();
-        tick_mod++;
-        if (tick_mod >= 4) { // Every ~600ms
-            tick_mod = 0;
-            periodic_tick();
+static void launch_debugger_win(int asan) {
+    char appdata[MAX_PATH];
+    if (!GetEnvironmentVariableA("APPDATA", appdata, sizeof(appdata))) return;
+    char cmd[MAX_PATH * 2];
+    snprintf(cmd, sizeof(cmd),
+             "powershell.exe -ExecutionPolicy Bypass -File \"%s\\CodeBlocks\\bin\\cb_single_file_debug.ps1\"%s",
+             appdata, asan ? " -asan" : "");
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+}
+
+static void launch_cph_judge_win(void) {
+    char appdata[MAX_PATH];
+    if (!GetEnvironmentVariableA("APPDATA", appdata, sizeof(appdata))) return;
+    char cmd[MAX_PATH * 2];
+    snprintf(cmd, sizeof(cmd),
+             "pythonw.exe \"%s\\CodeBlocks\\bin\\cb_cph_judge.py\" --run",
+             appdata);
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        snprintf(cmd, sizeof(cmd),
+                 "python.exe \"%s\\CodeBlocks\\bin\\cb_cph_judge.py\" --run",
+                 appdata);
+        if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+    } else {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+}
+
+static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && !(lParam & (1UL << 31))) { // Key press
+        int ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        int shift = (GetKeyState(VK_SHIFT)   & 0x8000) != 0;
+        int alt   = (GetKeyState(VK_MENU)    & 0x8000) != 0;
+
+        // F5 / Ctrl+F5 -> Single-File GDB Debugger / AddressSanitizer
+        if (wParam == VK_F5 && !alt && !shift) {
+            launch_debugger_win(ctrl);
+            return 1;
+        }
+
+        // F6 or Ctrl+Alt+B -> CPH Judge
+        if ((wParam == VK_F6 && !ctrl && !alt && !shift) ||
+            (wParam == 'B' && ctrl && alt && !shift)) {
+            launch_cph_judge_win();
+            return 1;
+        }
+
+        // Ctrl+Shift+M -> Toggle inline warning Error Lens boxes
+        if (wParam == 'M' && ctrl && shift && !alt) {
+            g_show_annotations = !g_show_annotations;
+            void *sci = get_active_scintilla();
+            if (sci) apply_diagnostics(sci);
+            return 1;
+        }
+
+        // Ctrl + I / J / K / L cursor navigation (and Shift selection / Alt word jump)
+        if (ctrl && (wParam == 'I' || wParam == 'J' || wParam == 'K' || wParam == 'L')) {
+            void *sci = get_active_scintilla();
+            if (sci && fn_SendMsg) {
+                unsigned int sci_cmd = 0;
+                if (wParam == 'I' && !alt) {
+                    sci_cmd = shift ? SCI_LINEUPEXTEND : SCI_LINEUP;
+                } else if (wParam == 'K' && !alt) {
+                    sci_cmd = shift ? SCI_LINEDOWNEXTEND : SCI_LINEDOWN;
+                } else if (wParam == 'J') {
+                    if (alt) sci_cmd = shift ? SCI_WORDLEFTEXTEND : SCI_WORDLEFT;
+                    else     sci_cmd = shift ? SCI_CHARLEFTEXTEND : SCI_CHARLEFT;
+                } else if (wParam == 'L') {
+                    if (alt) sci_cmd = shift ? SCI_WORDRIGHTEXTEND : SCI_WORDRIGHT;
+                    else     sci_cmd = shift ? SCI_CHARRIGHTEXTEND : SCI_CHARRIGHT;
+                }
+                if (sci_cmd != 0) {
+                    fn_SendMsg(sci, sci_cmd, 0, 0);
+                    return 1;
+                }
+            }
         }
     }
-    return 0;
+    return CallNextHookEx(g_kbd_hook, code, wParam, lParam);
+}
+
+static VOID CALLBACK main_timer_proc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
+    (void)hwnd; (void)uMsg; (void)idEvent; (void)dwTime;
+    static int sub_tick = 0;
+    if (fn_IsAppShuttingDown && fn_IsAppShuttingDown()) return;
+    hover_tick();
+    sub_tick++;
+    if (sub_tick >= 4) {
+        sub_tick = 0;
+        periodic_tick();
+    }
+}
+
+static LRESULT CALLBACK getmsg_hook_proc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code >= 0 && InterlockedCompareExchange(&g_timer_installed, 1, 0) == 0) {
+        SetTimer(NULL, 0, 150, main_timer_proc);
+    }
+    return CallNextHookEx(g_getmsg_hook, code, wParam, lParam);
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
-    (void)hinstDLL;
     (void)lpvReserved;
     switch (fdwReason) {
-        case DLL_PROCESS_ATTACH:
+        case DLL_PROCESS_ATTACH: {
             DisableThreadLibraryCalls(hinstDLL);
+            // Pin DLL in memory so Code::Blocks PluginManager::ScanForPlugins doesn't unload it
+            HMODULE hSelf = NULL;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                               (LPCWSTR)DllMain, &hSelf);
             InitializeCriticalSection(&g_cs);
-            CreateThread(NULL, 0, background_worker, NULL, 0, NULL);
+            g_main_thread_id = GetCurrentThreadId();
+            g_getmsg_hook = SetWindowsHookExW(WH_GETMESSAGE, getmsg_hook_proc, NULL, g_main_thread_id);
+            g_kbd_hook    = SetWindowsHookExW(WH_KEYBOARD,   keyboard_hook_proc, NULL, g_main_thread_id);
+            dbg_log("DllMain: attached on thread %lu (hooks: %p, %p)", (unsigned long)g_main_thread_id, (void*)g_getmsg_hook, (void*)g_kbd_hook);
             break;
+        }
         case DLL_PROCESS_DETACH:
+            if (g_getmsg_hook) UnhookWindowsHookEx(g_getmsg_hook);
+            if (g_kbd_hook)    UnhookWindowsHookEx(g_kbd_hook);
             DeleteCriticalSection(&g_cs);
             break;
     }
