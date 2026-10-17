@@ -7,7 +7,11 @@ if (-not (Test-Path (Join-Path $RepoDir "fonts"))) {
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "  Installing Code::Blocks VS Code Edition (Windows)" -ForegroundColor Cyan
-Write-Host "  NOTE: Windows version is experimental / unstable!" -ForegroundColor Yellow
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host " [!] WARNING: Windows version is EXPERIMENTAL & UNSTABLE!" -ForegroundColor Yellow
+Write-Host "     Code::Blocks on Windows has known architectural" -ForegroundColor Yellow
+Write-Host "     limitations (wxWidgets styling, parser thread locks)." -ForegroundColor Yellow
+Write-Host "     Linux is strongly recommended for the best experience." -ForegroundColor Yellow
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # 0. Ensure Code::Blocks is closed before writing config & plugin DLL

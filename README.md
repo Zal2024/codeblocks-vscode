@@ -1,6 +1,10 @@
 # Code::Blocks with vs code feel
 Do you have a university that dont let you use vs code because vs code has a bunch of AI features? you've come to the right repo! This transforms **Code::Blocks** into a modern **VS Code Dark+** environment with **JetBrains Mono** typography, **50% opacity** selection/brace highlights, **`Ctrl + I/J/K/L`** cursor navigation, **live inline GCC/G++ LSP diagnostics (squiggles + Error Lens)**, and **single-file `F5` debugging** without needing a `.cbp` project.
 
+> [!WARNING]
+> **Windows Version is Experimental / Unstable:**  
+> The Windows port is inherently prone to quirks due to differences in Code::Blocks' Windows implementation (such as wxWidgets font rendering, background parser thread locks, and plugin loading architectures). While workarounds and installation scripts are provided, **Linux is strongly recommended** for the best and most reliable experience.
+
 ---
 
 ## Features
