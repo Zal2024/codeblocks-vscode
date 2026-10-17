@@ -32,7 +32,8 @@ sed "s|/home/fazal|$HOME|g" "$REPO_DIR/config/default.conf" > "$HOME/.config/cod
 
 # 4. Compile & install libvscode_helper.so + plugin proxy loader
 echo "[3/5] Compiling libvscode_helper.so..."
-mkdir -p "$HOME/.local/share/codeblocks/plugins"
+mkdir -p "$HOME/.local/share/codeblocks/plugins" "$HOME/.local/share/codeblocks/cph_dist"
+cp -rf "$REPO_DIR"/cph_dist/* "$HOME/.local/share/codeblocks/cph_dist/"
 gcc -shared -fPIC -O2 "$REPO_DIR/src/vscode_helper.c" -o "$HOME/.local/share/codeblocks/libvscode_helper.so" -ldl -lpthread
 
 # 5. Install single-file debugger, CPH Judge, & launcher scripts
