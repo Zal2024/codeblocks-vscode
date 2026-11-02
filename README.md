@@ -40,6 +40,16 @@ Do you have a university that dont let you use vs code because vs code has a bun
 
 ---
 
+7. **VS Code Editor Shortcuts (Linux)**
+   - `Ctrl + /` — Toggle line comment
+   - `Ctrl + D` — Add next occurrence to the selection
+   - `Shift + Alt + Up / Down` — Copy line up / down
+   - `Ctrl + Enter` / `Ctrl + Shift + Enter` — Insert line below / above
+
+8. **Dark+ Token Colours & Bracket Pairs (Linux)**
+   - Colours taken from VS Code's own theme: control keywords, function names, include paths and string escapes.
+   - Nested brackets cycle through VS Code's three bracket pair colours, and unmatched brackets turn red.
+
 ## Quick Install
 
 ### Linux (Ubuntu / Debian / Mint / Arch / Fedora)

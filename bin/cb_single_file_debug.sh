@@ -11,6 +11,14 @@ for arg in "$@"; do
     fi
 done
 
+# F5 passes no file: use the tab the editor reports as active
+if [ -z "$TARGET_FILE" ] && [ -r /tmp/.cb_active_file ]; then
+    ACTIVE_FILE=$(head -n 1 /tmp/.cb_active_file)
+    case "$ACTIVE_FILE" in
+        *.c|*.cpp|*.cc|*.cxx) [ -f "$ACTIVE_FILE" ] && TARGET_FILE="$ACTIVE_FILE" ;;
+    esac
+fi
+
 if [ -z "$TARGET_FILE" ] || [ ! -f "$TARGET_FILE" ]; then
     CB_PID=$(pgrep -x codeblocks | head -n 1)
     if [ -n "$CB_PID" ]; then
@@ -25,6 +33,11 @@ if [ -z "$TARGET_FILE" ] || [ ! -f "$TARGET_FILE" ]; then
     TARGET_FILE=$(find "$HOME/Documents" -maxdepth 3 \( -name "*.c" -o -name "*.cpp" \) -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)
 fi
 
+if [ -z "$TARGET_FILE" ] || [ ! -f "$TARGET_FILE" ]; then
+    command -v notify-send >/dev/null 2>&1 && notify-send "Code::Blocks Debugger" "No active C/C++ source file found to debug."
+    exit 1
+fi
+
 DIR=$(dirname "$TARGET_FILE")
 BASE=$(basename "$TARGET_FILE")
 EXT="${BASE##*.}"
@@ -37,9 +50,10 @@ else
     CC_CMD="gcc"
 fi
 
-RUNNER="/tmp/cb_run_debug.sh"
+RUNNER=$(mktemp /tmp/cb_run_debug.XXXXXX)
 cat << SCRIPT > "$RUNNER"
 #!/usr/bin/env bash
+rm -f "$RUNNER"
 cd "$DIR" || exit 1
 echo -e "\033[1;34m==========================================================\033[0m"
 echo -e "\033[1;36m  VS Code-Style Single-File Debugger: $BASE\033[0m"

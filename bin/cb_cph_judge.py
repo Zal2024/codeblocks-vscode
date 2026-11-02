@@ -4,10 +4,13 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('WebKit2', '4.1')
 from gi.repository import Gtk, Gdk, GLib, WebKit2
 import hashlib
+import hmac
 import http.server
 import json
 import os
 import re
+import secrets
+import signal
 import socketserver
 import subprocess
 import sys
@@ -15,9 +18,26 @@ import threading
 import time
 import webbrowser
 
+PREFS_PATH = os.path.expanduser("~/.config/codeblocks/cph_judge.json")
+SOURCE_EXTENSIONS = (".c", ".cpp", ".cc", ".cxx", ".py")
+RUN_TRIGGER = "/tmp/.cb_cph_run_trigger"
 CPH_DIST = os.path.expanduser("~/.local/share/codeblocks/cph_dist")
 if not os.path.isdir(CPH_DIST):
     CPH_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cph_dist")
+
+def load_prefs():
+    try:
+        with open(PREFS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_prefs(prefs):
+    try:
+        with open(PREFS_PATH, "w", encoding="utf-8") as f:
+            json.dump(prefs, f)
+    except Exception:
+        pass
 
 def get_prob_path(src_path):
     d = os.path.dirname(src_path)
@@ -35,7 +55,7 @@ def detect_initial_file():
         try:
             with open("/tmp/.cb_active_file", "r") as f:
                 p = f.read().strip()
-            if os.path.isfile(p):
+            if os.path.isfile(p) and p.endswith(SOURCE_EXTENSIONS):
                 return p
         except Exception:
             pass
@@ -116,8 +136,12 @@ class CPHAppWindow(Gtk.Window):
         self.src_path = detect_initial_file()
         self.online_judge_env = False
         self.running_procs = []
-        self.last_trigger_mtime = 0
+        # A trigger left over from an earlier session is not a request to run
+        self.last_trigger_mtime = os.path.getmtime(RUN_TRIGGER) if os.path.isfile(RUN_TRIGGER) else 0
         self.webview_ready = False
+        self.run_generation = 0
+        self.prefs = load_prefs()
+        self.msg_token = secrets.token_urlsafe(32)
 
         # Start local HTTP server to serve original CPH dist/ and receive acquireVsCodeApi().postMessage
         self.port = self.start_http_server()
@@ -153,9 +177,10 @@ class CPHAppWindow(Gtk.Window):
                         "meowAudioUri": f"{base_url}/meow.mp3",
                         "remoteMessage": " ",
                         "generatedJsonUri": f"{base_url}/static/generated.json",
-                        "remoteServerAddress": "https://cph-Telemetry.divyanshuagrawal.com",
+                        # Empty stops the frontend's live-user-count request, which sends a uid
+                        "remoteServerAddress": "",
                         "showLiveUserCount": False,
-                        "showOutputDifference": True,
+                        "showOutputDifference": not app.prefs.get("hideOutputDifference", False),
                         "translations": translations,
                         "pythonCommand": "python3",
                         "cphSubmitServerFailed": False,
@@ -208,7 +233,7 @@ class CPHAppWindow(Gtk.Window):
                 postMessage: function(msg) {{
                     fetch("/__cph_msg", {{
                         method: "POST",
-                        headers: {{ "Content-Type": "application/json" }},
+                        headers: {{ "Content-Type": "application/json", "X-CPH-Token": {json.dumps(app.msg_token)} }},
                         body: JSON.stringify(msg)
                     }});
                 }},
@@ -237,6 +262,13 @@ class CPHAppWindow(Gtk.Window):
 
             def do_POST(self):
                 if self.path == "/__cph_msg":
+                    # Web pages can reach this port, so require the token and the exact Host
+                    token = self.headers.get("X-CPH-Token", "")
+                    host_ok = self.headers.get("Host") == f"127.0.0.1:{app.port}"
+                    if not host_ok or not hmac.compare_digest(token, app.msg_token):
+                        self.send_response(403)
+                        self.end_headers()
+                        return
                     length = int(self.headers.get("Content-Length", "0"))
                     raw = self.rfile.read(length).decode("utf-8")
                     self.send_response(200)
@@ -345,6 +377,7 @@ class CPHAppWindow(Gtk.Window):
                 "onlineJudgeEnv": self.online_judge_env,
             })
         elif cmd == "kill-running":
+            self.run_generation += 1
             for p in list(self.running_procs):
                 try:
                     p.kill()
@@ -362,6 +395,9 @@ class CPHAppWindow(Gtk.Window):
             if prob:
                 self.save_problem(prob["srcPath"], prob)
                 threading.Thread(target=self.run_all_and_save, args=(prob,), daemon=True).start()
+        elif cmd == "set-hide-output-diff":
+            self.prefs["hideOutputDifference"] = bool(msg.get("value"))
+            save_prefs(self.prefs)
         elif cmd == "url":
             url = msg.get("url")
             if url:
@@ -376,7 +412,8 @@ class CPHAppWindow(Gtk.Window):
             return ["python3", src_path]
         ext = os.path.splitext(src_path)[1]
         cc = "g++" if ext in (".cpp", ".cc", ".cxx") else "gcc"
-        out_bin = f"/tmp/cph_bin_{os.getuid()}"
+        digest = hashlib.md5(src_path.encode("utf-8")).hexdigest()[:12]
+        out_bin = f"/tmp/cph_bin_{os.getuid()}_{digest}"
         cmd = [cc, "-O2", "-Wall", src_path, "-o", out_bin, "-lm"]
         if self.online_judge_env:
             cmd.insert(2, "-DONLINE_JUDGE")
@@ -413,14 +450,19 @@ class CPHAppWindow(Gtk.Window):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                errors="replace",
                 env={**os.environ, "DEBUG": "true", "CPH": "true"},
             )
             self.running_procs.append(proc)
             try:
-                stdout, stderr = proc.communicate(input=inp, timeout=3.0)
+                time_limit = float(prob.get("timeLimit") or 3000) / 1000.0
+                stdout, stderr = proc.communicate(input=inp, timeout=time_limit)
                 code = proc.returncode
                 if code < 0:
-                    sig = f"SIG{-code}"
+                    try:
+                        sig = signal.Signals(-code).name
+                    except ValueError:
+                        sig = f"SIG{-code}"
             except subprocess.TimeoutExpired:
                 timed_out = True
                 proc.kill()
@@ -451,10 +493,13 @@ class CPHAppWindow(Gtk.Window):
         GLib.idle_add(self.send_to_webview, {"command": "run-single-result", "result": result, "problem": prob})
 
     def run_all_and_save(self, prob):
+        generation = self.run_generation
         run_cmd = self.compile_file(prob["srcPath"])
         if not run_cmd:
             return
         for tc in prob.get("tests", []):
+            if generation != self.run_generation:
+                return  # Stopped by kill-running
             self.run_single_and_save(prob, tc["id"], skip_compile=True, run_cmd=run_cmd)
 
     def poll_active_file(self):
@@ -464,7 +509,7 @@ class CPHAppWindow(Gtk.Window):
             try:
                 with open("/tmp/.cb_active_file", "r") as f:
                     p = f.read().strip()
-                if p and p != self.src_path and os.path.isfile(p) and p.endswith((".c", ".cpp", ".cc", ".cxx", ".py")):
+                if p and p != self.src_path and os.path.isfile(p) and p.endswith(SOURCE_EXTENSIONS):
                     self.src_path = p
                     prob = self.get_problem_for_path(p, auto_create=True)
                     self.send_to_webview({
@@ -474,9 +519,9 @@ class CPHAppWindow(Gtk.Window):
                     })
             except Exception:
                 pass
-        if os.path.isfile("/tmp/.cb_cph_run_trigger"):
+        if os.path.isfile(RUN_TRIGGER):
             try:
-                mt = os.path.getmtime("/tmp/.cb_cph_run_trigger")
+                mt = os.path.getmtime(RUN_TRIGGER)
                 if mt > self.last_trigger_mtime:
                     self.last_trigger_mtime = mt
                     self.present()
@@ -493,22 +538,28 @@ class CPHAppWindow(Gtk.Window):
         return True
 
 
+def judge_already_running(pid_file):
+    """True only if the recorded PID is alive and still this script, not a reused PID."""
+    try:
+        with open(pid_file, "r") as pf:
+            old_pid = int(pf.read().strip())
+        with open(f"/proc/{old_pid}/cmdline", "rb") as cf:
+            return b"cb_cph_judge" in cf.read()
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
-    if "--run" in sys.argv:
-        try:
-            with open("/tmp/.cb_cph_run_trigger", "w") as tf:
-                tf.write(str(time.time()))
-        except Exception:
-            pass
     pid_file = "/tmp/.cb_cph_judge.pid"
-    if os.path.isfile(pid_file):
-        try:
-            with open(pid_file, "r") as pf:
-                old_pid = int(pf.read().strip())
-            os.kill(old_pid, 0)
-            sys.exit(0)
-        except Exception:
-            pass
+    if judge_already_running(pid_file):
+        # Ask the running judge to run. A fresh start handles --run itself once the page loads.
+        if "--run" in sys.argv:
+            try:
+                with open(RUN_TRIGGER, "w") as tf:
+                    tf.write(str(time.time()))
+            except Exception:
+                pass
+        sys.exit(0)
     try:
         with open(pid_file, "w") as pf:
             pf.write(str(os.getpid()))
@@ -516,5 +567,6 @@ if __name__ == "__main__":
         pass
     win = CPHAppWindow()
     win.connect("destroy", Gtk.main_quit)
+    win.connect("destroy", lambda _w: os.path.isfile(pid_file) and os.remove(pid_file))
     win.show_all()
     Gtk.main()
