@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
+export GTK_THEME="${GTK_THEME:-Adwaita:dark}"
 export LD_PRELOAD="$HOME/.local/share/codeblocks/libvscode_helper.so${LD_PRELOAD:+:$LD_PRELOAD}"
 exec /usr/bin/codeblocks "$@"

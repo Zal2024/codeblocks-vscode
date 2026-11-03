@@ -243,10 +243,19 @@ class CPHAppWindow(Gtk.Window):
         }};
         window.vscodeApi = acquireVsCodeApi();
         Object.assign(window, {json.dumps(init_globals)});
-        document.addEventListener('DOMContentLoaded', () => {{
-            vscodeApi.postMessage({{ command: 'get-initial-problem' }});
-            vscodeApi.postMessage({{ command: 'online-judge-env', value: 'default' }});
-        }});
+        let cphInitSent = false;
+        const origAddEventListener = window.addEventListener.bind(window);
+        window.addEventListener = function(type, listener, options) {{
+            const res = origAddEventListener(type, listener, options);
+            if (type === 'message' && !cphInitSent) {{
+                cphInitSent = true;
+                setTimeout(() => {{
+                    vscodeApi.postMessage({{ command: 'get-initial-problem' }});
+                    vscodeApi.postMessage({{ command: 'online-judge-env', value: 'default' }});
+                }}, 0);
+            }}
+            return res;
+        }};
     </script>
     <script src="{base_url}/frontend.module.js"></script>
 </body>
@@ -294,6 +303,15 @@ class CPHAppWindow(Gtk.Window):
         js = f"window.postMessage({json.dumps(msg)}, '*');"
         self.webview.run_javascript(js, None, None, None)
 
+    def send_new_problem(self, prob):
+        msg = {
+            "command": "new-problem",
+            "onlineJudgeEnv": self.online_judge_env,
+        }
+        if prob is not None:
+            msg["problem"] = prob
+        self.send_to_webview(msg)
+
     def get_problem_for_path(self, path, auto_create=False):
         if not path or not os.path.isfile(path):
             return None
@@ -338,14 +356,10 @@ class CPHAppWindow(Gtk.Window):
         if cmd == "get-initial-problem":
             self.webview_ready = True
             prob = self.get_problem_for_path(self.src_path, auto_create=True)
-            self.send_to_webview({
-                "command": "new-problem",
-                "problem": prob,
-                "onlineJudgeEnv": self.online_judge_env,
-            })
+            self.send_new_problem(prob)
             if "--run" in sys.argv and prob:
                 sys.argv.remove("--run")
-                threading.Thread(target=self.run_all_and_save, args=(prob,), daemon=True).start()
+                threading.Thread(target=self.run_all_and_save, args=(prob, True), daemon=True).start()
         elif cmd == "online-judge-env":
             val = msg.get("value")
             if val == "true":
@@ -360,22 +374,14 @@ class CPHAppWindow(Gtk.Window):
                 self.save_problem(prob["srcPath"], prob)
         elif cmd == "create-local-problem":
             prob = self.get_problem_for_path(self.src_path, auto_create=True)
-            self.send_to_webview({
-                "command": "new-problem",
-                "problem": prob,
-                "onlineJudgeEnv": self.online_judge_env,
-            })
+            self.send_new_problem(prob)
         elif cmd == "delete-tcs":
             prob = msg.get("problem")
             if prob and "srcPath" in prob:
                 pfile = get_prob_path(prob["srcPath"])
                 if os.path.isfile(pfile):
                     os.remove(pfile)
-            self.send_to_webview({
-                "command": "new-problem",
-                "problem": None,
-                "onlineJudgeEnv": self.online_judge_env,
-            })
+            self.send_new_problem(None)
         elif cmd == "kill-running":
             self.run_generation += 1
             for p in list(self.running_procs):
@@ -492,7 +498,9 @@ class CPHAppWindow(Gtk.Window):
         }
         GLib.idle_add(self.send_to_webview, {"command": "run-single-result", "result": result, "problem": prob})
 
-    def run_all_and_save(self, prob):
+    def run_all_and_save(self, prob, delay_for_mount=False):
+        if delay_for_mount:
+            time.sleep(0.08)
         generation = self.run_generation
         run_cmd = self.compile_file(prob["srcPath"])
         if not run_cmd:
@@ -512,11 +520,7 @@ class CPHAppWindow(Gtk.Window):
                 if p and p != self.src_path and os.path.isfile(p) and p.endswith(SOURCE_EXTENSIONS):
                     self.src_path = p
                     prob = self.get_problem_for_path(p, auto_create=True)
-                    self.send_to_webview({
-                        "command": "new-problem",
-                        "problem": prob,
-                        "onlineJudgeEnv": self.online_judge_env,
-                    })
+                    self.send_new_problem(prob)
             except Exception:
                 pass
         if os.path.isfile(RUN_TRIGGER):
@@ -527,12 +531,8 @@ class CPHAppWindow(Gtk.Window):
                     self.present()
                     prob = self.get_problem_for_path(self.src_path, auto_create=True)
                     if prob:
-                        self.send_to_webview({
-                            "command": "new-problem",
-                            "problem": prob,
-                            "onlineJudgeEnv": self.online_judge_env,
-                        })
-                        threading.Thread(target=self.run_all_and_save, args=(prob,), daemon=True).start()
+                        self.send_new_problem(prob)
+                        threading.Thread(target=self.run_all_and_save, args=(prob, True), daemon=True).start()
             except Exception:
                 pass
         return True

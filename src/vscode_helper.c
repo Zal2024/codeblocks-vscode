@@ -56,6 +56,7 @@ typedef void  (*wxWindow_DoScreenToClient_fn)(void *win, int *x, int *y);
 typedef void* (*wxFindWindowAtPointer_fn)(int *pt);
 typedef void* (*wxWindowBase_FindFocus_fn)(void);
 typedef void* (*ProjectManager_FindProjectForFile_fn)(void *pmgr, const void *wxstr_path, void **result, int is_relative, int is_unix);
+typedef int   (*ProjectManager_IsProjectStillOpen_fn)(void *pmgr, void *proj);
 
 static Manager_Get_fn fn_Manager_Get = NULL;
 static Manager_GetAppWindow_fn fn_GetAppWindow = NULL;
@@ -81,6 +82,7 @@ static wxWindow_DoScreenToClient_fn fn_ScreenToClient = NULL;
 static wxFindWindowAtPointer_fn fn_FindWindowAtPointer = NULL;
 static wxWindowBase_FindFocus_fn fn_FindFocus = NULL;
 static ProjectManager_FindProjectForFile_fn fn_FindProjectForFile = NULL;
+static ProjectManager_IsProjectStillOpen_fn fn_IsProjectStillOpen = NULL;
 
 // Scintilla constants
 #define SCI_GETLENGTH               2006
@@ -235,17 +237,6 @@ static void *g_our_proj = NULL;      // The auto-generated project; compared, ne
 static void *g_file_owner = NULL;    // Project containing the active file
 
 
-static void dbg_log(const char *fmt, ...) {
-    FILE *fp = fopen("/tmp/vscode_helper.log", "a");
-    if (!fp) return;
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(fp, fmt, ap);
-    fprintf(fp, "\n");
-    va_end(ap);
-    fclose(fp);
-}
-
 static void resolve_cb_symbols(void) {
     if (fn_Manager_Get) return;
     fn_Manager_Get = (Manager_Get_fn)dlsym(RTLD_DEFAULT, "_ZN7Manager3GetEv");
@@ -271,6 +262,7 @@ static void resolve_cb_symbols(void) {
     fn_FindWindowAtPointer = (wxFindWindowAtPointer_fn)dlsym(RTLD_DEFAULT, "_Z21wxFindWindowAtPointerR7wxPoint");
     fn_FindFocus = (wxWindowBase_FindFocus_fn)dlsym(RTLD_DEFAULT, "_ZN12wxWindowBase9FindFocusEv");
     fn_FindProjectForFile = (ProjectManager_FindProjectForFile_fn)dlsym(RTLD_DEFAULT, "_ZN14ProjectManager18FindProjectForFileERK8wxStringPP11ProjectFilebb");
+    fn_IsProjectStillOpen = (ProjectManager_IsProjectStillOpen_fn)dlsym(RTLD_DEFAULT, "_ZN14ProjectManager18IsProjectStillOpenEP9cbProject");
 }
 
 static void* get_active_editor_base(void) {
@@ -368,6 +360,31 @@ static void* find_file_owner(void *pmgr, const char *file) {
     return fn_FindProjectForFile(pmgr, wxstr, NULL, 0, 0);
 }
 
+// Keep g_our_proj in ProjectManager::m_pProjects so the left Projects -> Workspace
+// tree shows all files in the folder, but clear m_pActiveProject (offset 0x68) and
+// cbEditor::m_pProjectFile (offset 0x448) so CompilerGCC (F9 / Ctrl+F9 / Ctrl+F10 /
+// toolbar Build & Run) always compiles and runs the active editor file standalone!
+static void detach_our_project_from_compiler(void) {
+    if (!g_our_proj || !fn_Manager_Get || !fn_GetProjectManager) return;
+    void *mgr = fn_Manager_Get();
+    if (!mgr) return;
+    void *pmgr = fn_GetProjectManager(mgr);
+    if (pmgr && *(void**)((char*)pmgr + 0x68) == g_our_proj) {
+        *(void**)((char*)pmgr + 0x68) = NULL;
+    }
+    void *eb = get_active_editor_base();
+    if (eb && fn_GetEditorManager && fn_GetBuiltinEditor) {
+        void *emgr = fn_GetEditorManager(mgr);
+        void *cbed = emgr ? fn_GetBuiltinEditor(emgr, eb) : NULL;
+        if (cbed) {
+            void *pf = *(void**)((char*)cbed + 0x448);
+            if (pf && *(void**)((char*)pf + 0x230) == g_our_proj) {
+                *(void**)((char*)cbed + 0x448) = NULL;
+            }
+        }
+    }
+}
+
 static void clear_project_modified(void *pmgr, void *proj) {
     if (proj && fn_ProjSetModified) fn_ProjSetModified(proj, 0);
     if (fn_GetWorkspace && fn_WsSetModified) {
@@ -379,6 +396,7 @@ static void clear_project_modified(void *pmgr, void *proj) {
         void (**vtable)(void*) = *(void (***)(void*))ui;
         if (vtable && vtable[4]) vtable[4](ui); // m_ui->RebuildTree() at offset 0x20
     }
+    detach_our_project_from_compiler();
 }
 
 static void sync_folder_workspace(const char *active_file) {
@@ -401,6 +419,11 @@ static void sync_folder_workspace(const char *active_file) {
     void *pmgr = fn_GetProjectManager(mgr);
     if (!pmgr) return;
 
+    if (g_our_proj && fn_IsProjectStillOpen && !fn_IsProjectStillOpen(pmgr, g_our_proj)) {
+        g_our_proj = NULL;
+        g_workspace_dir[0] = '\0';
+    }
+
     char dir[1024];
     strncpy(dir, active_file, sizeof(dir) - 1);
     dir[sizeof(dir) - 1] = '\0';
@@ -415,12 +438,12 @@ static void sync_folder_workspace(const char *active_file) {
 
     // Never displace a project the user opened: leave its files, and any file
     // opened while it is active, to Code::Blocks.
-    if (file_changed || !active_proj) g_file_owner = find_file_owner(pmgr, active_file);
+    if (file_changed || !g_file_owner) g_file_owner = find_file_owner(pmgr, active_file);
     if (g_file_owner && g_file_owner != g_our_proj) return;
     if (active_proj && active_proj != g_our_proj) return;
 
-    // Case 1: New folder or no active project loaded yet -> build .vscode_workspace.cbp & load it
-    if (strcmp(g_workspace_dir, dir) != 0 || !active_proj) {
+    // Case 1: New folder or no folder project loaded yet -> build .vscode_workspace.cbp & load it
+    if (strcmp(g_workspace_dir, dir) != 0 || !g_our_proj) {
         DIR *dp = opendir(dir);
         if (!dp) return;
 
@@ -455,7 +478,7 @@ static void sync_folder_workspace(const char *active_file) {
             if (is_source_or_project_file(de->d_name)) {
                 fprintf(fp, "\t\t<Unit filename=\"");
                 fprint_xml_attr(fp, de->d_name);
-                fprintf(fp, "\" />\n");
+                fprintf(fp, "\">\n\t\t\t<Option compile=\"0\" />\n\t\t\t<Option link=\"0\" />\n\t\t</Unit>\n");
                 remember_file(de->d_name);
             }
         }
@@ -478,7 +501,7 @@ static void sync_folder_workspace(const char *active_file) {
     }
 
     // Case 2: Same folder, check if user saved a brand-new file into this folder
-    if (active_proj != g_our_proj || !fn_AddFileToProject) return;
+    if (!g_our_proj || !fn_AddFileToProject) return;
     DIR *dp = opendir(dir);
     if (!dp) return;
     int added_any = 0;
@@ -491,13 +514,14 @@ static void sync_folder_workspace(const char *active_file) {
             unsigned char wxstr[64];
             memset(wxstr, 0, sizeof(wxstr));
             fn_cbC2U(wxstr, full_p);
-            fn_AddFileToProject(pmgr, wxstr, active_proj, 0);
+            fn_AddFileToProject(pmgr, wxstr, g_our_proj, 0);
             added_any = 1;
         }
     }
     closedir(dp);
 
-    if (added_any) clear_project_modified(pmgr, active_proj);
+    if (added_any) clear_project_modified(pmgr, g_our_proj);
+    else detach_our_project_from_compiler();
 }
 
 static uint64_t hash_str(const char *s, size_t len) {
@@ -898,6 +922,7 @@ static void refresh_overlay_if_edited(void *sci) {
 // flagged line for VS Code's editor.hover.delay of 300ms.
 static int hover_tick(void *data) {
     (void)data;
+    detach_our_project_from_compiler();
     void *sci = get_active_scintilla();
     if (!sci || !fn_SendMsg) return 1;
 
@@ -950,10 +975,48 @@ static int hover_tick(void *data) {
     return 1;
 }
 
+// TEMP TEST HOOK: drive Build/Run in-process from /tmp/.cb_test_cmd
+static void test_hook(void) {
+    FILE *f = fopen("/tmp/.cb_test_cmd", "r");
+    if (!f) return;
+    char line[1200] = {0};
+    if (!fgets(line, sizeof(line), f)) line[0] = 0;
+    fclose(f);
+    unlink("/tmp/.cb_test_cmd");
+    char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+    resolve_cb_symbols();
+    void *mgr = fn_Manager_Get ? fn_Manager_Get() : NULL;
+    if (!mgr) return;
+    dbg_log("TEST: cmd='%s'", line);
+    if (!strncmp(line, "open ", 5)) {
+        typedef void* (*open_fn)(void*, const void*, int, void*);
+        open_fn op = (open_fn)dlsym(RTLD_DEFAULT, "_ZN13EditorManager4OpenERK8wxStringiP11ProjectFile");
+        unsigned char wxstr[64]; memset(wxstr, 0, sizeof(wxstr));
+        fn_cbC2U(wxstr, line + 5);
+        void *r = op ? op(fn_GetEditorManager(mgr), wxstr, 0, NULL) : NULL;
+        dbg_log("TEST: open -> %p", r);
+        return;
+    }
+    typedef void* (*gpm_fn)(void*);
+    typedef void* (*gfc_fn)(void*);
+    gpm_fn gpm = (gpm_fn)dlsym(RTLD_DEFAULT, "_ZNK7Manager16GetPluginManagerEv");
+    gfc_fn gfc = (gfc_fn)dlsym(RTLD_DEFAULT, "_ZNK13PluginManager16GetFirstCompilerEv");
+    void *comp = (gpm && gfc) ? gfc(gpm(mgr)) : NULL;
+    void *h = dlopen("/usr/lib/codeblocks/plugins/libcompiler.so", RTLD_NOW | RTLD_NOLOAD);
+    typedef void (*ev_fn)(void*, void*);
+    const char *sym = !strcmp(line, "buildrun") ? "_ZN11CompilerGCC15OnCompileAndRunER14wxCommandEvent"
+                    : !strcmp(line, "run") ? "_ZN11CompilerGCC5OnRunER14wxCommandEvent" : NULL;
+    ev_fn fn = (h && sym) ? (ev_fn)dlsym(h, sym) : NULL;
+    dbg_log("TEST: comp=%p h=%p fn=%p active=%p", comp, h, (void*)fn,
+            *(void**)((char*)fn_GetProjectManager(mgr) + 0x68));
+    static char dummy[256];
+    if (comp && fn) fn(comp, dummy);
+}
+
 static int periodic_tick(void *data) {
     (void)data;
     g_tick_counter++;
-    if (g_tick_counter <= 10) dbg_log("periodic_tick: counter=%d sci=%p", g_tick_counter, get_active_scintilla());
+    test_hook();
     if (g_tick_counter >= 5) g_startup_ready = 1;
     void *sci = get_active_scintilla();
     if (!sci || !fn_SendMsg) return 1;
@@ -1210,6 +1273,8 @@ static int my_key_snooper(void *grab_widget, GdkEventKey_t *event, void *func_da
     (void)func_data;
     if (!event) return 0;
 
+    if (event->type == 8) detach_our_project_from_compiler();
+
     // F5 (0xffc2) = Single-File Visual GDB Debugger, Ctrl+F5 = AddressSanitizer
     if (event->type == 8 && event->keyval == 0xffc2) {
         int ctrl = (event->state & 4) != 0;
@@ -1303,14 +1368,12 @@ static void init_vscode_helper(void) {
 
     gtk_key_snooper_install_fn install_snooper =
         (gtk_key_snooper_install_fn)dlsym(RTLD_DEFAULT, "gtk_key_snooper_install");
-    dbg_log("init_vscode_helper: install_snooper=%p", (void*)install_snooper);
     if (install_snooper) {
         install_snooper(my_key_snooper, NULL);
     }
 
     g_timeout_add_fn timeout_add =
         (g_timeout_add_fn)dlsym(RTLD_DEFAULT, "g_timeout_add");
-    dbg_log("init_vscode_helper: timeout_add=%p", (void*)timeout_add);
     if (timeout_add) {
         timeout_add(650, periodic_tick, NULL);
         timeout_add(150, hover_tick, NULL);
