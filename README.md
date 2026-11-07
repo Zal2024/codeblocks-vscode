@@ -18,6 +18,7 @@ Do you have a university that dont let you use vs code because vs code has a bun
 
 2. **Auto-Workspace & Folder File Detection**
    - Opening or saving any file automatically sets its parent folder as the active **Workspace** in the left **Projects** sidebar and detects all other source/project files in that folder (including newly saved files), just like VS Code's Explorer.
+   - Starting Code::Blocks without a file reopens the last folder and the tabs you had open, with the same tab active, like VS Code. Opening a file or a `.cbp` project directly starts with just that.
 
 3. **`Ctrl + I / J / K / L` Cursor Navigation**
    - `Ctrl + I` / `Ctrl + K` / `Ctrl + J` / `Ctrl + L` — Move **Up / Down / Left / Right**
@@ -28,10 +29,11 @@ Do you have a university that dont let you use vs code because vs code has a bun
 4. **Live VS Code LSP Diagnostics, Squiggles & Mouse Hover Tooltips**
    - Background `gcc`/`g++ -fsyntax-only -Wall -Wextra -Wformat=2` checker runs automatically as you type.
    - **Warnings** (such as `unused variable` or `uninitialized`) show only a subtle **yellow squiggly underline** underneath the code, and display the warning message in a dark popup tooltip **only when you hover your mouse over it**.
-   - **Errors** draw red squiggly underlines and inline **Error Lens** boxes (press **`Ctrl + Shift + M`** to toggle inline boxes for warnings too).
+   - **Errors** draw a red squiggly underline and, like warnings, show their message when you hover over it. Press **`Ctrl + Shift + M`** to toggle inline **Error Lens** boxes for every error and warning.
 
 5. **CPH Judge (Competitive Programming Helper) — `Ctrl + Alt + B` / `F6`**
    - Press **`Ctrl + Alt + B`** or **`F6`** (or **Tools → CPH Judge**) to open the **CPH Judge: Results** sidebar and run all testcases against your active file.
+   - Every run saves your unsaved changes first and recompiles, like VS Code's CPH, so it always tests the code you see.
    - Reads and writes `.cph/*.prob` testcase files (100% compatible with VS Code's CPH extension), with `+ New Testcase`, per-testcase `▷` Run & `🗑` Delete, `Set ONLINE_JUDGE`, execution time in `ms`, and `N / M passed` badges.
 
 6. **Single-File Debugging (`F5` & `Ctrl + F5`) — No Project Required**
@@ -45,10 +47,16 @@ Do you have a university that dont let you use vs code because vs code has a bun
    - `Ctrl + D` — Add next occurrence to the selection
    - `Shift + Alt + Up / Down` — Copy line up / down
    - `Ctrl + Enter` / `Ctrl + Shift + Enter` — Insert line below / above
+   - Typing `)` or `]` only jumps over a closing bracket that was auto-inserted as you typed, like VS Code. Inside a `()` you typed earlier, it types a real `)`.
 
 8. **Dark+ Token Colours & Bracket Pairs (Linux)**
    - Colours taken from VS Code's own theme: control keywords, function names, include paths and string escapes.
    - Nested brackets cycle through VS Code's three bracket pair colours, and unmatched brackets turn red.
+
+9. **VS Code Toolbar (Linux)**
+   - Buttons next to the build toolbar, with VS Code's own icons: **CPH Judge**, **Debug** (`F5`), **Run with sanitizers** (`Ctrl + F5`), **toggle inline messages** (`Ctrl + Shift + M`), and **Controls & Instructions** (`?`), a list of every shortcut and a short CPH guide.
+   - Hide or show it from **View → Toolbars → VS Code Toolbar**. Code::Blocks remembers your choice.
+   - The installer builds it against your Code::Blocks version. If the SDK headers aren't installed, it downloads them with `apt-get download` (no root needed). If the build fails, everything else still works.
 
 ## Quick Install
 

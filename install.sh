@@ -52,6 +52,17 @@ else
     echo "[!] libcopystrings.so not found (install codeblocks-contrib): use the desktop launcher or ~/.local/bin/codeblocks."
 fi
 
+# Toolbar with CPH Judge / Debug / ASan / warnings / help buttons (optional: needs matching SDK headers)
+echo "      Building the VS Code toolbar plugin..."
+TOOLBAR_BUILD="$(mktemp -d)"
+if bash "$REPO_DIR/tools/build_toolbar_plugin.sh" "$TOOLBAR_BUILD"; then
+    cp -f "$TOOLBAR_BUILD/libvscode_toolbar.so" "$HOME/.local/share/codeblocks/plugins/libvscode_toolbar.so"
+    cp -f "$TOOLBAR_BUILD/vscode_toolbar.zip" "$HOME/.local/share/codeblocks/vscode_toolbar.zip"
+else
+    echo "[!] Toolbar plugin not built: everything else still works (F5, Ctrl+F5, F6 / Ctrl+Alt+B)."
+fi
+rm -rf "$TOOLBAR_BUILD"
+
 # 5. Install single-file debugger, CPH Judge, & launcher scripts
 echo "[4/5] Installing single-file GDB/ASan debugger & CPH Judge scripts..."
 mkdir -p "$HOME/.local/bin"

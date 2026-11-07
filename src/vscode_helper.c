@@ -103,6 +103,8 @@ static ProjectManager_IsProjectStillOpen_fn fn_IsProjectStillOpen = NULL;
 #define SCI_CALLTIPSHOW             2200
 #define SCI_CALLTIPCANCEL           2201
 #define SCI_CALLTIPACTIVE           2202
+#define SCI_CALLTIPPOSSTART         2203
+#define SCI_CALLTIPSETPOSSTART      2214
 #define SCI_CALLTIPSETBACK          2205
 #define SCI_CALLTIPSETFORE          2206
 #define SCI_SETFOLDMARGINCOLOUR     2290
@@ -179,6 +181,12 @@ static ProjectManager_IsProjectStillOpen_fn fn_IsProjectStillOpen = NULL;
 #define INDIC_BRACKET3              26
 #define INDIC_BRACKET_BAD           27
 #define INDIC_PLAIN                 28
+#define INDIC_AUTOCLOSED            30   // Hidden mark on closing brackets C::B auto-inserted
+#define INDIC_STYLE_HIDDEN          5
+#define SCI_INDICATORVALUEAT_       2507
+#define SCI_REPLACESEL_             2170
+#define SCI_GETSELECTIONEND_        2145
+#define SCI_GETSELECTIONS_          2570
 
 #define INDIC_SQUIGGLE              1
 #define ANNOTATION_BOXED            2
@@ -212,12 +220,17 @@ static void *g_applied_sci = NULL;
 static int g_applied_annotations = -1;
 static uint64_t g_last_hash = 0;
 static void *g_last_sci = NULL;
-static int g_show_annotations = 0; // Default: yellow warnings only show squiggle + hover tooltip
+static int g_show_annotations = 0; // Default: squiggles only, message on hover
 static int g_checker_busy = 0;
 static int g_hover_calltip_active = 0;
 static int g_last_hover_line = -1;
 static int g_hover_candidate_line = -1;
 static int g_hover_dwell = 0;
+static int g_hover_reshows = 0;
+static char g_hover_text[sizeof(((DiagItem *)0)->msg)]; // Message the hover tip shows
+// Stored as our calltip's start position, so we can tell when another calltip replaced it.
+// A position past any document also makes Scintilla drop the tip as soon as a key moves the caret.
+#define HOVER_TIP_MARK 0x3FFFFFF0L
 static char g_lsp_dir[64] = "";      // Private per-process dir, so two windows never share a buffer
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -236,6 +249,19 @@ static char g_last_active[1024] = "";
 static void *g_our_proj = NULL;      // The auto-generated project; compared, never dereferenced
 static void *g_file_owner = NULL;    // Project containing the active file
 
+
+// Debug log for test_hook; it was still called after its definition was removed,
+// which left an undefined symbol that stopped the plugin proxy's dlopen(RTLD_NOW).
+static void dbg_log(const char *fmt, ...) {
+    FILE *fp = fopen("/tmp/vscode_helper.log", "a");
+    if (!fp) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    fprintf(fp, "\n");
+    va_end(ap);
+    fclose(fp);
+}
 
 static void resolve_cb_symbols(void) {
     if (fn_Manager_Get) return;
@@ -287,9 +313,9 @@ static void* get_active_scintilla(void) {
     return fn_GetControl(cbed);
 }
 
-static int get_active_filepath(char *out_path, size_t max_len) {
+// EditorBase::m_Filename (wxString at 0x2f0) as UTF-8/locale bytes
+static int editor_path(void *eb, char *out_path, size_t max_len) {
     out_path[0] = '\0';
-    void *eb = get_active_editor_base();
     if (!eb) return 0;
     const wchar_t *wpath = *(const wchar_t**)((char*)eb + 0x2f0);
     if (!wpath || !wpath[0]) return 0;
@@ -300,6 +326,10 @@ static int get_active_filepath(char *out_path, size_t max_len) {
     }
     out_path[n] = '\0';
     return (out_path[0] == '/');
+}
+
+static int get_active_filepath(char *out_path, size_t max_len) {
+    return editor_path(get_active_editor_base(), out_path, max_len);
 }
 
 static const char *file_ext(const char *path) {
@@ -399,6 +429,65 @@ static void clear_project_modified(void *pmgr, void *proj) {
     detach_our_project_from_compiler();
 }
 
+// Writes <dir>/.vscode_workspace.cbp listing the folder's files and loads it as our project
+static void load_folder_project(void *pmgr, const char *dir) {
+    const char *folder_name = strrchr(dir, '/');
+    folder_name = folder_name ? (folder_name + 1) : dir;
+    DIR *dp = opendir(dir);
+    if (!dp) return;
+
+    char cbp_path[1100];
+    snprintf(cbp_path, sizeof(cbp_path), "%s/.vscode_workspace.cbp", dir);
+    FILE *fp = fopen(cbp_path, "w");
+    if (!fp) {
+        closedir(dp);
+        return;
+    }
+
+    fprintf(fp, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n");
+    fprintf(fp, "<CodeBlocks_project_file>\n");
+    fprintf(fp, "\t<FileVersion major=\"1\" minor=\"6\" />\n");
+    fprintf(fp, "\t<Project>\n");
+    fprintf(fp, "\t\t<Option title=\"");
+    fprint_xml_attr(fp, folder_name);
+    fprintf(fp, "\" />\n");
+    fprintf(fp, "\t\t<Option pch_mode=\"2\" />\n");
+    fprintf(fp, "\t\t<Option compiler=\"gcc\" />\n");
+    fprintf(fp, "\t\t<Build>\n");
+    fprintf(fp, "\t\t\t<Target title=\"Debug\">\n");
+    fprintf(fp, "\t\t\t\t<Option output=\"bin/Debug/app\" prefix_auto=\"1\" extension_auto=\"1\" />\n");
+    fprintf(fp, "\t\t\t\t<Option type=\"1\" />\n");
+    fprintf(fp, "\t\t\t\t<Option compiler=\"gcc\" />\n");
+    fprintf(fp, "\t\t\t</Target>\n");
+    fprintf(fp, "\t\t</Build>\n");
+
+    g_seen_count = 0;
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL && g_seen_count < 256) {
+        if (is_source_or_project_file(de->d_name)) {
+            fprintf(fp, "\t\t<Unit filename=\"");
+            fprint_xml_attr(fp, de->d_name);
+            fprintf(fp, "\">\n\t\t\t<Option compile=\"0\" />\n\t\t\t<Option link=\"0\" />\n\t\t</Unit>\n");
+            remember_file(de->d_name);
+        }
+    }
+    closedir(dp);
+
+    fprintf(fp, "\t</Project>\n");
+    fprintf(fp, "</CodeBlocks_project_file>\n");
+    fclose(fp);
+
+    snprintf(g_workspace_dir, sizeof(g_workspace_dir), "%s", dir);
+
+    unsigned char wxstr[64];
+    memset(wxstr, 0, sizeof(wxstr));
+    fn_cbC2U(wxstr, cbp_path);
+    void *proj = fn_LoadProject(pmgr, wxstr, 1);
+    g_our_proj = proj;
+    g_file_owner = proj;
+    clear_project_modified(pmgr, proj);
+}
+
 static void sync_folder_workspace(const char *active_file) {
     if (!active_file || active_file[0] != '/') return;
 
@@ -444,59 +533,7 @@ static void sync_folder_workspace(const char *active_file) {
 
     // Case 1: New folder or no folder project loaded yet -> build .vscode_workspace.cbp & load it
     if (strcmp(g_workspace_dir, dir) != 0 || !g_our_proj) {
-        DIR *dp = opendir(dir);
-        if (!dp) return;
-
-        char cbp_path[1100];
-        snprintf(cbp_path, sizeof(cbp_path), "%s/.vscode_workspace.cbp", dir);
-        FILE *fp = fopen(cbp_path, "w");
-        if (!fp) {
-            closedir(dp);
-            return;
-        }
-
-        fprintf(fp, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n");
-        fprintf(fp, "<CodeBlocks_project_file>\n");
-        fprintf(fp, "\t<FileVersion major=\"1\" minor=\"6\" />\n");
-        fprintf(fp, "\t<Project>\n");
-        fprintf(fp, "\t\t<Option title=\"");
-        fprint_xml_attr(fp, folder_name);
-        fprintf(fp, "\" />\n");
-        fprintf(fp, "\t\t<Option pch_mode=\"2\" />\n");
-        fprintf(fp, "\t\t<Option compiler=\"gcc\" />\n");
-        fprintf(fp, "\t\t<Build>\n");
-        fprintf(fp, "\t\t\t<Target title=\"Debug\">\n");
-        fprintf(fp, "\t\t\t\t<Option output=\"bin/Debug/app\" prefix_auto=\"1\" extension_auto=\"1\" />\n");
-        fprintf(fp, "\t\t\t\t<Option type=\"1\" />\n");
-        fprintf(fp, "\t\t\t\t<Option compiler=\"gcc\" />\n");
-        fprintf(fp, "\t\t\t</Target>\n");
-        fprintf(fp, "\t\t</Build>\n");
-
-        g_seen_count = 0;
-        struct dirent *de;
-        while ((de = readdir(dp)) != NULL && g_seen_count < 256) {
-            if (is_source_or_project_file(de->d_name)) {
-                fprintf(fp, "\t\t<Unit filename=\"");
-                fprint_xml_attr(fp, de->d_name);
-                fprintf(fp, "\">\n\t\t\t<Option compile=\"0\" />\n\t\t\t<Option link=\"0\" />\n\t\t</Unit>\n");
-                remember_file(de->d_name);
-            }
-        }
-        closedir(dp);
-
-        fprintf(fp, "\t</Project>\n");
-        fprintf(fp, "</CodeBlocks_project_file>\n");
-        fclose(fp);
-
-        snprintf(g_workspace_dir, sizeof(g_workspace_dir), "%s", dir);
-
-        unsigned char wxstr[64];
-        memset(wxstr, 0, sizeof(wxstr));
-        fn_cbC2U(wxstr, cbp_path);
-        void *proj = fn_LoadProject(pmgr, wxstr, 1);
-        g_our_proj = proj;
-        g_file_owner = proj;
-        clear_project_modified(pmgr, proj);
+        load_folder_project(pmgr, dir);
         return;
     }
 
@@ -777,9 +814,9 @@ static void apply_diagnostics(void *sci) {
         fn_SendMsg(sci, SCI_SETINDICATORCURRENT, indic, 0);
         fn_SendMsg(sci, SCI_INDICATORFILLRANGE, start, end - start);
 
-        // Warnings (e.g., unused variable / uninitialized) ONLY show yellow squiggle below;
-        // full message appears on mouse hover (or if Ctrl+Shift+M forces inline boxes).
-        if (g_diags[i].is_err || g_show_annotations) {
+        // Errors and warnings only get a squiggle; the message shows when the mouse rests
+        // on it. Ctrl+Shift+M (or the toolbar's eye button) adds inline boxes for all of them.
+        if (g_show_annotations) {
             fn_SendMsg(sci, SCI_ANNOTATIONSETTEXT, line, (long)g_diags[i].msg);
             fn_SendMsg(sci, SCI_ANNOTATIONSETSTYLE, line, g_diags[i].is_err ? STYLE_LSP_ERROR : STYLE_LSP_WARN);
         }
@@ -906,6 +943,7 @@ static void hide_hover(void *sci) {
     g_last_hover_line = -1;
     g_hover_candidate_line = -1;
     g_hover_dwell = 0;
+    g_hover_reshows = 0;
 }
 
 // Refreshes colours soon after a keystroke rather than on the slower periodic tick
@@ -920,9 +958,12 @@ static void refresh_overlay_if_edited(void *sci) {
 
 // Fast 150ms hover check: shows the warning/error tooltip once the pointer has rested on a
 // flagged line for VS Code's editor.hover.delay of 300ms.
+static void handle_cph_save_request(void); // Defined with the session code below
+
 static int hover_tick(void *data) {
     (void)data;
     detach_our_project_from_compiler();
+    handle_cph_save_request();
     void *sci = get_active_scintilla();
     if (!sci || !fn_SendMsg) return 1;
 
@@ -944,6 +985,11 @@ static int hover_tick(void *data) {
     long pos = fn_SendMsg(sci, SCI_POSITIONFROMPOINTCLOSE, (unsigned long)mx, (long)my);
     if (pos >= 0) {
         long line = fn_SendMsg(sci, SCI_LINEFROMPOSITION, (unsigned long)pos, 0);
+        // Only over the squiggle itself, which runs from the first non-blank character to
+        // the end of the line (see apply_diagnostics)
+        long sq_start = fn_SendMsg(sci, SCI_GETLINEINDENTPOSITION, (unsigned long)line, 0);
+        long sq_end = fn_SendMsg(sci, SCI_GETLINEENDPOSITION, (unsigned long)line, 0);
+        if (pos < sq_start || pos > sq_end) line = -1;
         pthread_mutex_lock(&g_mutex);
         int found = -1;
         for (int i = 0; g_diag_sci == sci && i < g_diag_count; i++) {
@@ -956,12 +1002,27 @@ static int hover_tick(void *data) {
             if (g_hover_candidate_line != (int)line) {
                 g_hover_candidate_line = (int)line;
                 g_hover_dwell = 0;
+                g_hover_reshows = 0;
             }
             if (g_hover_dwell < 2) g_hover_dwell++;
-            if (g_hover_dwell >= 2 && (!g_hover_calltip_active || g_last_hover_line != (int)line)) {
+            // Code::Blocks shows its own symbol tooltip about a second into a hover, which
+            // replaces ours; put the message back (a few times at most, so a calltip the user
+            // is typing against is not fought over).
+            int ours_showing = g_hover_calltip_active && g_last_hover_line == (int)line &&
+                               strcmp(g_hover_text, g_diags[found].msg) == 0 &&
+                               fn_SendMsg(sci, SCI_CALLTIPACTIVE, 0, 0) &&
+                               fn_SendMsg(sci, SCI_CALLTIPPOSSTART, 0, 0) == HOVER_TIP_MARK;
+            int may_show = !g_hover_calltip_active || g_last_hover_line != (int)line ||
+                           strcmp(g_hover_text, g_diags[found].msg) != 0 || g_hover_reshows < 3;
+            if (g_hover_dwell >= 2 && !ours_showing && may_show) {
+                if (g_hover_calltip_active && g_last_hover_line == (int)line &&
+                    strcmp(g_hover_text, g_diags[found].msg) == 0)
+                    g_hover_reshows++;
+                snprintf(g_hover_text, sizeof(g_hover_text), "%s", g_diags[found].msg);
                 fn_SendMsg(sci, SCI_CALLTIPSETBACK, 0x262525, 0); // #252526 VS Code hover background
                 fn_SendMsg(sci, SCI_CALLTIPSETFORE, g_diags[found].is_err ? 0x8080F4 : 0x60C8F0, 0);
                 fn_SendMsg(sci, SCI_CALLTIPSHOW, (unsigned long)pos, (long)g_diags[found].msg);
+                fn_SendMsg(sci, SCI_CALLTIPSETPOSSTART, (unsigned long)HOVER_TIP_MARK, 0);
                 g_hover_calltip_active = 1;
                 g_last_hover_line = (int)line;
             }
@@ -1013,11 +1074,190 @@ static void test_hook(void) {
     if (comp && fn) fn(comp, dummy);
 }
 
+// ---- Session: reopen the last folder and its tabs on a plain start, like VS Code ----
+// ~/.config/codeblocks/vscode_session holds "folder\t<dir>", "file\t<path>" (tab order)
+// and "active\t<path>" lines. It is only written after the restore attempt, so a start
+// that is still loading can never overwrite the previous session.
+typedef int (*EM_GetEditorsCount_fn)(void *);
+typedef void *(*EM_GetEditor_fn)(void *, int);
+typedef void *(*EM_Open_fn)(void *, const void *, int, void *);
+#define SESSION_MAX_FILES 64
+static int g_session_restored = 0;
+static char g_session_last[SESSION_MAX_FILES * 1100 + 4096];
+
+static int session_file_path(char *out, size_t n) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return 0;
+    snprintf(out, n, "%s/.config/codeblocks/vscode_session", home);
+    return 1;
+}
+
+// The open source-editor tabs (not the Start page), in tab order
+static int open_editor_paths(void *emgr, char paths[][1024], int max) {
+    static EM_GetEditorsCount_fn count_fn;
+    static EM_GetEditor_fn get_fn;
+    if (!count_fn) count_fn = (EM_GetEditorsCount_fn)dlsym(RTLD_DEFAULT, "_ZN13EditorManager15GetEditorsCountEv");
+    if (!get_fn) get_fn = (EM_GetEditor_fn)dlsym(RTLD_DEFAULT, "_ZN13EditorManager9GetEditorEi");
+    if (!count_fn || !get_fn || !fn_GetBuiltinEditor) return -1;
+    int n = 0, total = count_fn(emgr);
+    for (int i = 0; i < total && n < max; i++) {
+        void *eb = get_fn(emgr, i);
+        if (eb && fn_GetBuiltinEditor(emgr, eb) && editor_path(eb, paths[n], 1024)) n++;
+    }
+    return n;
+}
+
+static void *session_editor_manager(void) {
+    resolve_cb_symbols();
+    if (!g_startup_ready || !fn_Manager_Get || !fn_IsAppShuttingDown || !fn_GetEditorManager) return NULL;
+    if (fn_IsAppShuttingDown()) return NULL; // tabs close one by one while shutting down
+    void *mgr = fn_Manager_Get();
+    if (!mgr || !fn_GetAppWindow || !fn_GetAppWindow(mgr)) return NULL;
+    return fn_GetEditorManager(mgr);
+}
+
+static void save_session(void) {
+    void *emgr = session_editor_manager();
+    if (!emgr || !g_session_restored) return;
+    static char paths[SESSION_MAX_FILES][1024];
+    int n = open_editor_paths(emgr, paths, SESSION_MAX_FILES);
+    if (n < 0) return;
+    char active[1024];
+    if (!get_active_filepath(active, sizeof(active))) active[0] = '\0';
+
+    static char buf[sizeof(g_session_last)];
+    size_t len = 0;
+    len += snprintf(buf + len, sizeof(buf) - len, "folder\t%s\n", g_our_proj ? g_workspace_dir : "");
+    for (int i = 0; i < n && len < sizeof(buf); i++)
+        len += snprintf(buf + len, sizeof(buf) - len, "file\t%s\n", paths[i]);
+    if (len < sizeof(buf) && active[0])
+        len += snprintf(buf + len, sizeof(buf) - len, "active\t%s\n", active);
+    if (len >= sizeof(buf) || strcmp(buf, g_session_last) == 0) return;
+
+    char path[1100], tmp[1200];
+    if (!session_file_path(path, sizeof(path))) return;
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    int ok = fputs(buf, f) >= 0;
+    ok = (fclose(f) == 0) && ok;
+    if (ok && rename(tmp, path) == 0) memcpy(g_session_last, buf, len + 1);
+    else unlink(tmp);
+}
+
+static int is_regular_file(const char *p) {
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+// Once, when the window is ready: only if nothing was opened from the command line and
+// no project is loaded, so "codeblocks file.c" and opening a .cbp behave as before.
+static void restore_session(void) {
+    void *emgr = session_editor_manager();
+    if (!emgr || g_session_restored) return;
+    g_session_restored = 1;
+
+    void *mgr = fn_Manager_Get();
+    void *pmgr = fn_GetProjectManager ? fn_GetProjectManager(mgr) : NULL;
+    static char open_now[SESSION_MAX_FILES][1024];
+    if (open_editor_paths(emgr, open_now, SESSION_MAX_FILES) != 0) return;
+    if (!pmgr || *(void **)((char *)pmgr + 0x68)) return;
+
+    char path[1100];
+    if (!session_file_path(path, sizeof(path))) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    EM_Open_fn open_fn = (EM_Open_fn)dlsym(RTLD_DEFAULT, "_ZN13EditorManager4OpenERK8wxStringiP11ProjectFile");
+    char line[1200], folder[1024] = "", active[1024] = "";
+    int opened = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        char *val = strchr(line, '\t');
+        if (!val) continue;
+        *val++ = '\0';
+        if (!strcmp(line, "folder")) snprintf(folder, sizeof(folder), "%s", val);
+        else if (!strcmp(line, "active")) snprintf(active, sizeof(active), "%s", val);
+        else if (!strcmp(line, "file") && open_fn && fn_cbC2U && val[0] == '/' && is_regular_file(val)) {
+            unsigned char wxstr[64];
+            memset(wxstr, 0, sizeof(wxstr));
+            fn_cbC2U(wxstr, val);
+            if (open_fn(emgr, wxstr, 0, NULL)) opened++;
+        }
+    }
+    fclose(f);
+
+    if (opened && active[0] && is_regular_file(active)) {
+        unsigned char wxstr[64]; // Open() on an open file makes it the active tab
+        memset(wxstr, 0, sizeof(wxstr));
+        fn_cbC2U(wxstr, active);
+        open_fn(emgr, wxstr, 0, NULL);
+    } else if (!opened && folder[0] && fn_LoadProject && fn_cbC2U) {
+        struct stat st;
+        if (stat(folder, &st) == 0 && S_ISDIR(st.st_mode)) load_folder_project(pmgr, folder);
+    }
+}
+
+// ---- Save-before-compile for CPH Judge, as VS Code's CPH saves the document first ----
+// The judge writes "<token>\t<path>" to /tmp/.cb_cph_save_request; we save that file's tab
+// if it has unsaved changes and answer with the token in /tmp/.cb_cph_save_done.
+#define CPH_SAVE_REQUEST "/tmp/.cb_cph_save_request"
+#define CPH_SAVE_DONE    "/tmp/.cb_cph_save_done"
+typedef int (*cbEditor_Save_fn)(void *);
+typedef int (*cbEditor_GetModified_fn)(const void *);
+
+static void handle_cph_save_request(void) {
+    struct stat st;
+    if (stat(CPH_SAVE_REQUEST, &st) != 0) return;
+    void *emgr = session_editor_manager();
+    if (!emgr) return;
+    FILE *f = fopen(CPH_SAVE_REQUEST, "r");
+    if (!f) return;
+    char line[1200] = "";
+    if (!fgets(line, sizeof(line), f)) line[0] = '\0';
+    fclose(f);
+    unlink(CPH_SAVE_REQUEST);
+    line[strcspn(line, "\n")] = '\0';
+    char *path = strchr(line, '\t');
+    if (!path) return;
+    *path++ = '\0';
+
+    static EM_GetEditorsCount_fn count_fn;
+    static EM_GetEditor_fn get_fn;
+    static cbEditor_Save_fn save_fn;
+    static cbEditor_GetModified_fn modified_fn;
+    if (!count_fn) count_fn = (EM_GetEditorsCount_fn)dlsym(RTLD_DEFAULT, "_ZN13EditorManager15GetEditorsCountEv");
+    if (!get_fn) get_fn = (EM_GetEditor_fn)dlsym(RTLD_DEFAULT, "_ZN13EditorManager9GetEditorEi");
+    if (!save_fn) save_fn = (cbEditor_Save_fn)dlsym(RTLD_DEFAULT, "_ZN8cbEditor4SaveEv");
+    if (!modified_fn) modified_fn = (cbEditor_GetModified_fn)dlsym(RTLD_DEFAULT, "_ZNK8cbEditor11GetModifiedEv");
+    const char *result = "notopen";
+    if (count_fn && get_fn && save_fn && modified_fn && fn_GetBuiltinEditor) {
+        int total = count_fn(emgr);
+        char p[1024];
+        for (int i = 0; i < total; i++) {
+            void *eb = get_fn(emgr, i);
+            void *ed = eb ? fn_GetBuiltinEditor(emgr, eb) : NULL;
+            if (!ed || !editor_path(eb, p, sizeof(p)) || strcmp(p, path) != 0) continue;
+            if (!modified_fn(ed)) result = "unchanged";
+            else result = save_fn(ed) ? "saved" : "failed";
+            break;
+        }
+    }
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", CPH_SAVE_DONE);
+    FILE *d = fopen(tmp, "w");
+    if (!d) return;
+    fprintf(d, "%s\t%s\n", line, result);
+    fclose(d);
+    rename(tmp, CPH_SAVE_DONE);
+}
+
 static int periodic_tick(void *data) {
     (void)data;
     g_tick_counter++;
     test_hook();
     if (g_tick_counter >= 5) g_startup_ready = 1;
+    restore_session();
+    if (g_tick_counter % 3 == 0) save_session();
     void *sci = get_active_scintilla();
     if (!sci || !fn_SendMsg) return 1;
 
@@ -1088,7 +1328,10 @@ static void launch_debugger(int asan) {
 }
 
 static void launch_cph_judge(void) {
-    int r = system("$HOME/.local/bin/cb_cph_judge.py --run >/dev/null 2>&1 &");
+    // CB_PID lets the judge close itself when this Code::Blocks exits
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "CB_PID=%d $HOME/.local/bin/cb_cph_judge.py --run >/dev/null 2>&1 &", (int)getpid());
+    int r = system(cmd);
     (void)r;
 }
 
@@ -1268,6 +1511,68 @@ static int run_editor_command(GdkEventKey_t *event) {
     return 1;
 }
 
+// Also called by the toolbar plugin (libvscode_toolbar.so), so it is exported
+__attribute__((visibility("default"))) void vscode_helper_toggle_inline_warnings(void) {
+    g_show_annotations = !g_show_annotations;
+    void *sci = get_active_scintilla();
+    if (sci) apply_diagnostics(sci);
+}
+
+// ---- VS Code's autoClosingOvertype: "auto" ----
+// Code::Blocks jumps over any ")" or "]" right after the caret, even one typed long ago, so
+// typing ")" inside an existing "()" is swallowed. VS Code only jumps over closers it
+// auto-inserted itself. We mark the closer C::B auto-inserts (checked on the next key, when
+// C::B has finished handling the opener) and type a real closer over unmarked ones.
+static void *g_open_sci = NULL;
+static long g_open_pos = -1;
+static int g_open_char = 0;
+
+static int closer_for(int c) { return c == '(' ? ')' : c == '[' ? ']' : 0; }
+
+static void mark_pending_autoclose(void) {
+    void *sci = g_open_sci;
+    g_open_sci = NULL;
+    if (!sci || sci != get_active_scintilla()) return;
+    long caret = fn_SendMsg(sci, SCI_GETCURRENTPOS, 0, 0);
+    if (caret != g_open_pos + 1) return;
+    if (fn_SendMsg(sci, SCI_GETCHARAT, (unsigned long)g_open_pos, 0) != g_open_char) return;
+    if (fn_SendMsg(sci, SCI_GETCHARAT, (unsigned long)caret, 0) != closer_for(g_open_char)) return;
+    fn_SendMsg(sci, SCI_INDICSETSTYLE, INDIC_AUTOCLOSED, INDIC_STYLE_HIDDEN);
+    fn_SendMsg(sci, SCI_SETINDICATORCURRENT, INDIC_AUTOCLOSED, 0);
+    fn_SendMsg(sci, SCI_INDICATORFILLRANGE, (unsigned long)caret, 1);
+}
+
+// Returns 1 when the key was handled (a real closer typed) and must not reach C::B
+static int handle_bracket_key(GdkEventKey_t *event) {
+    if (!fn_SendMsg) return 0;
+    mark_pending_autoclose();
+    if (event->state & (4 | 8)) return 0; // Ctrl / Alt combinations are commands
+    uint32_t k = event->keyval;
+    if (k != '(' && k != '[' && k != ')' && k != ']') return 0;
+    void *sci = focused_editor();
+    if (!sci) return 0;
+    if (fn_SendMsg(sci, SCI_GETSELECTIONS_, 0, 0) != 1) return 0;
+    long caret = fn_SendMsg(sci, SCI_GETCURRENTPOS, 0, 0);
+    if (fn_SendMsg(sci, SCI_GETSELECTIONEND_, 0, 0) != fn_SendMsg(sci, SCI_GETSELECTIONSTART, 0, 0))
+        return 0; // Wrapping a selection in brackets stays C::B's
+
+    if (k == '(' || k == '[') { // Let C::B insert the pair, then mark it on the next key
+        g_open_sci = sci;
+        g_open_pos = caret;
+        g_open_char = (int)k;
+        return 0;
+    }
+    if (fn_SendMsg(sci, SCI_GETCHARAT, (unsigned long)caret, 0) != (long)k) return 0;
+    if (fn_SendMsg(sci, SCI_INDICATORVALUEAT_, INDIC_AUTOCLOSED, (long)caret)) {
+        fn_SendMsg(sci, SCI_SETINDICATORCURRENT, INDIC_AUTOCLOSED, 0);
+        fn_SendMsg(sci, SCI_INDICATORCLEARRANGE, (unsigned long)caret, 1);
+        return 0; // Ours: C::B jumps over it, as VS Code does
+    }
+    const char text[2] = { (char)k, 0 };
+    fn_SendMsg(sci, SCI_REPLACESEL_, 0, (long)text);
+    return 1;
+}
+
 static int my_key_snooper(void *grab_widget, GdkEventKey_t *event, void *func_data) {
     (void)grab_widget;
     (void)func_data;
@@ -1289,16 +1594,15 @@ static int my_key_snooper(void *grab_widget, GdkEventKey_t *event, void *func_da
         return 1;
     }
 
-    // Ctrl+Shift+M = Toggle inline warning Error Lens boxes
+    // Ctrl+Shift+M = Toggle inline Error Lens boxes
     if (event->type == 8 && (event->state & 4) && (event->state & 1) &&
         (event->keyval == 'm' || event->keyval == 'M')) {
-        g_show_annotations = !g_show_annotations;
-        void *sci = get_active_scintilla();
-        if (sci) apply_diagnostics(sci);
+        vscode_helper_toggle_inline_warnings();
         return 1;
     }
 
     if (event->type == 8 && run_editor_command(event)) return 1;
+    if (event->type == 8 && handle_bracket_key(event)) return 1;
 
     // Ctrl + I / J / K / L cursor navigation
     if (event->state & 4) {

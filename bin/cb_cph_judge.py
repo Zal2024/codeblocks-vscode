@@ -21,6 +21,8 @@ import webbrowser
 PREFS_PATH = os.path.expanduser("~/.config/codeblocks/cph_judge.json")
 SOURCE_EXTENSIONS = (".c", ".cpp", ".cc", ".cxx", ".py")
 RUN_TRIGGER = "/tmp/.cb_cph_run_trigger"
+SAVE_REQUEST = "/tmp/.cb_cph_save_request"  # Answered by libvscode_helper.so in Code::Blocks
+SAVE_DONE = "/tmp/.cb_cph_save_done"
 CPH_DIST = os.path.expanduser("~/.local/share/codeblocks/cph_dist")
 if not os.path.isdir(CPH_DIST):
     CPH_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cph_dist")
@@ -153,10 +155,73 @@ class CPHAppWindow(Gtk.Window):
         settings.set_enable_media(True)
         self.webview.set_background_color(Gdk.RGBA(0.118, 0.118, 0.118, 1.0))
 
-        self.add(self.webview)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.pack_start(self.webview, True, True, 0)
+        box.pack_start(self.build_error_panel(), False, False, 0)
+        self.add(box)
         self.webview.load_uri(f"http://127.0.0.1:{self.port}/__cph_app.html")
 
         GLib.timeout_add(350, self.poll_active_file)
+
+        # Close with Code::Blocks, as CPH's panel closes with its VS Code window
+        self.owner_pid = find_owner_codeblocks()
+        if self.owner_pid:
+            GLib.timeout_add(1000, self.check_owner_alive)
+
+    def check_owner_alive(self):
+        if is_codeblocks(self.owner_pid):
+            return True
+        for p in list(self.running_procs):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        self.destroy()
+        return False
+
+    def build_error_panel(self):
+        """Compiler errors go here, as they go to VS Code's Output panel in the real CPH."""
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+            #cph-errors { background: #1e1e1e; border-top: 1px solid #454545; }
+            #cph-errors-title { color: #f48771; font-weight: bold; }
+            #cph-errors-text, #cph-errors-text text { background: #1e1e1e; color: #cccccc;
+                font-family: monospace; font-size: 9pt; }
+        """)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        panel.set_name("cph-errors")
+        panel.set_border_width(6)
+        header = Gtk.Box(spacing=6)
+        title = Gtk.Label(label="Compilation failed", xalign=0)
+        title.set_name("cph-errors-title")
+        close = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        close.set_relief(Gtk.ReliefStyle.NONE)
+        close.set_tooltip_text("Hide")
+        close.connect("clicked", lambda _b: self.error_revealer.set_reveal_child(False))
+        header.pack_start(title, True, True, 0)
+        header.pack_end(close, False, False, 0)
+        self.error_view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
+        self.error_view.set_name("cph-errors-text")
+        self.error_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_min_content_height(170)
+        scroller.add(self.error_view)
+        panel.pack_start(header, False, False, 0)
+        panel.pack_start(scroller, True, True, 0)
+        self.error_revealer = Gtk.Revealer()
+        self.error_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
+        self.error_revealer.add(panel)
+        return self.error_revealer
+
+    def show_compile_error(self, text):
+        if text is None:
+            self.error_revealer.set_reveal_child(False)
+        else:
+            self.error_view.get_buffer().set_text(text.strip() or "The compiler failed without output.")
+            self.error_revealer.set_reveal_child(True)
+        return False
 
     def start_http_server(self):
         app = self
@@ -411,8 +476,42 @@ class CPHAppWindow(Gtk.Window):
         elif cmd == "get-ext-logs":
             self.send_to_webview({"command": "ext-logs", "logs": "CPH Judge connected to Code::Blocks.\n"})
 
+    def save_in_editor(self, src_path, timeout=1.0):
+        """Saves unsaved edits in Code::Blocks before compiling, as VS Code's CPH saves the
+        document first. Returns the helper's answer, or None when nobody answered."""
+        if subprocess.run(["pgrep", "-x", "codeblocks"], capture_output=True).returncode != 0:
+            return None
+        token = secrets.token_hex(8)
+        try:
+            if os.path.exists(SAVE_DONE):
+                os.remove(SAVE_DONE)
+            tmp = SAVE_REQUEST + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(f"{token}\t{src_path}\n")
+            os.replace(tmp, SAVE_REQUEST)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                time.sleep(0.04)
+                try:
+                    with open(SAVE_DONE, "r", encoding="utf-8") as f:
+                        got, _, result = f.read().strip().partition("\t")
+                    if got == token:
+                        return result
+                except FileNotFoundError:
+                    pass
+        except OSError:
+            pass
+        finally:
+            for p in (SAVE_REQUEST, SAVE_DONE):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        return None
+
     def compile_file(self, src_path):
         GLib.idle_add(self.send_to_webview, {"command": "compiling-start"})
+        self.save_in_editor(src_path)
         if src_path.endswith(".py"):
             GLib.idle_add(self.send_to_webview, {"command": "compiling-stop"})
             return ["python3", src_path]
@@ -420,14 +519,23 @@ class CPHAppWindow(Gtk.Window):
         cc = "g++" if ext in (".cpp", ".cc", ".cxx") else "gcc"
         digest = hashlib.md5(src_path.encode("utf-8")).hexdigest()[:12]
         out_bin = f"/tmp/cph_bin_{os.getuid()}_{digest}"
-        cmd = [cc, "-O2", "-Wall", src_path, "-o", out_bin, "-lm"]
+        # Compiled from its own folder by name, so messages read "file.c:4:27: error" as in VS Code
+        cmd = [cc, "-O2", "-Wall", os.path.basename(src_path), "-o", out_bin, "-lm"]
         if self.online_judge_env:
             cmd.insert(2, "-DONLINE_JUDGE")
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            GLib.idle_add(self.send_to_webview, {"command": "compiling-stop", "error": res.stderr})
-            return None
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                                 cwd=os.path.dirname(src_path) or None)
+            ok, err = res.returncode == 0, res.stderr
+        except OSError as e:
+            ok, err = False, f"Could not run {cc}: {e}"
         GLib.idle_add(self.send_to_webview, {"command": "compiling-stop"})
+        if not ok:
+            # Like CPH: clear the "Running" state and show the compiler output
+            GLib.idle_add(self.send_to_webview, {"command": "not-running"})
+            GLib.idle_add(self.show_compile_error, err)
+            return None
+        GLib.idle_add(self.show_compile_error, None)
         return [out_bin]
 
     def run_single_and_save(self, prob, tc_id, skip_compile=False, run_cmd=None):
@@ -536,6 +644,35 @@ class CPHAppWindow(Gtk.Window):
             except Exception:
                 pass
         return True
+
+
+def is_codeblocks(pid):
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            return f.read().strip() == "codeblocks"
+    except OSError:
+        return False
+
+
+def find_owner_codeblocks():
+    """The Code::Blocks this judge belongs to: CB_PID from the helper, else the nearest
+    codeblocks ancestor (Tools menu, toolbar). None when started on its own."""
+    try:
+        pid = int(os.environ.get("CB_PID", "0"))
+        if pid > 0 and is_codeblocks(pid):
+            return pid
+    except ValueError:
+        pass
+    pid = os.getppid()
+    while pid > 1:
+        if is_codeblocks(pid):
+            return pid
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
 
 
 def judge_already_running(pid_file):

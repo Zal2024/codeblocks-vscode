@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<CodeBlocks_plugin_manifest_file>
+    <SdkVersion major="2" minor="23" release="0" />
+    <Plugin name="vscode_toolbar">
+        <Value title="VS Code Toolbar" />
+        <Value version="1.0" />
+        <Value description="Toolbar buttons for CPH Judge, the single-file debugger, AddressSanitizer, inline warnings, and a controls reference." />
+        <Value author="Zal2024" />
+        <Value authorEmail="" />
+        <Value authorWebsite="https://github.com/Zal2024/codeblocks-vscode" />
+        <Value thanksTo="Icons: VS Code codicons (CC BY 4.0)." />
+        <Value license="GPL-3.0" />
+    </Plugin>
+</CodeBlocks_plugin_manifest_file>
